@@ -2,6 +2,7 @@ package com.deadman;
 
 import com.google.gson.Gson;
 import com.google.inject.Provides;
+import java.awt.image.BufferedImage;
 import java.io.IOException;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -13,6 +14,9 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.ImageUtil;
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.MediaType;
@@ -45,6 +49,12 @@ public class DeadmanPlugin extends Plugin
 	@Inject
 	private DeadmanConfig config;
 
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	private BossBreachPanel bossBreachPanel;
+	private NavigationButton navButton;
+
 	@Provides
 	DeadmanConfig provideConfig(ConfigManager configManager)
 	{
@@ -55,12 +65,44 @@ public class DeadmanPlugin extends Plugin
 	protected void startUp()
 	{
 		log.info("Deadman plugin started");
+
+		bossBreachPanel = new BossBreachPanel();
+
+		BufferedImage icon;
+		try
+		{
+			icon = ImageUtil.loadImageResource(getClass(), "/net/runelite/client/plugins/hiscore/deadman.png");
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to load deadman icon, using fallback", e);
+			icon = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+		}
+
+		navButton = NavigationButton.builder()
+			.tooltip("Boss Breach Timer")
+			.icon(icon)
+			.panel(bossBreachPanel)
+			.priority(5)
+			.build();
+
+		clientToolbar.addNavigation(navButton);
 	}
 
 	@Override
 	protected void shutDown()
 	{
 		log.info("Deadman plugin stopped");
+
+		if (navButton != null)
+		{
+			clientToolbar.removeNavigation(navButton);
+		}
+
+		if (bossBreachPanel != null)
+		{
+			bossBreachPanel.stopTimer();
+		}
 	}
 
 	@Subscribe

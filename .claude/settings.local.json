@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew run:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(./gradlew build:*)",
+      "Bash(git remote:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git:*)",
+      "Bash(gh repo:*)",
+      "Bash(where gh:*)",
+      "Bash(cp:*)",
+      "Bash(./gradlew compileJava:*)",
+      "Bash(xargs jar:*)",
+      "Bash(jar tf:*)"
+    ]
+  }
+}
