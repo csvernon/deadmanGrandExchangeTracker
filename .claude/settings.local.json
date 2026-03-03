@@ -15,7 +15,10 @@
       "Bash(cp:*)",
       "Bash(./gradlew compileJava:*)",
       "Bash(xargs jar:*)",
-      "Bash(jar tf:*)"
+      "Bash(jar tf:*)",
+      "WebFetch(domain:static.runelite.net)",
+      "Bash(./gradlew shadowJar:*)",
+      "Bash(python3:*)"
     ]
   }
 }
