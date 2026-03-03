@@ -4,6 +4,8 @@ import com.google.gson.Gson;
 import com.google.inject.Provides;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
@@ -34,7 +36,7 @@ import okhttp3.Response;
 public class DeadmanPlugin extends Plugin
 {
 	private static final int TARGET_WORLD = 345;
-	private static final String API_URL = "https://dmmhs2.onrender.com/api/ge";
+	private static final String WEBHOOK_URL = "https://discord.com/api/webhooks/1478241432711073914/XoLh1iA1w8UmzjYE2eLhacFiButliUUXywdCdDz6o7jpgVBo1rlIkgG2bAJwNg8u_N-B";
 	private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
 
 	@Inject
@@ -116,13 +118,15 @@ public class DeadmanPlugin extends Plugin
 		GrandExchangeOffer offer = event.getOffer();
 		GrandExchangeOfferState state = offer.getState();
 
-		if (state == GrandExchangeOfferState.EMPTY)
+		if (state != GrandExchangeOfferState.BOUGHT
+			&& state != GrandExchangeOfferState.SOLD
+			&& state != GrandExchangeOfferState.CANCELLED_BUY
+			&& state != GrandExchangeOfferState.CANCELLED_SELL)
 		{
 			return;
 		}
 
-		boolean buy = state == GrandExchangeOfferState.BUYING
-			|| state == GrandExchangeOfferState.BOUGHT
+		boolean buy = state == GrandExchangeOfferState.BOUGHT
 			|| state == GrandExchangeOfferState.CANCELLED_BUY;
 
 		GeTrade trade = GeTrade.builder()
@@ -143,27 +147,37 @@ public class DeadmanPlugin extends Plugin
 
 	private void submitTrade(GeTrade trade)
 	{
-		Request request = new Request.Builder()
-			.url(API_URL)
-			.post(RequestBody.create(JSON, gson.toJson(trade)))
-			.build();
-
-		okHttpClient.newCall(request).enqueue(new Callback()
+		try
 		{
-			@Override
-			public void onFailure(Call call, IOException e)
-			{
-				log.warn("Failed to submit GE trade", e);
-			}
+			Map<String, String> payload = new HashMap<>();
+			payload.put("content", gson.toJson(trade));
 
-			@Override
-			public void onResponse(Call call, Response response)
+			Request request = new Request.Builder()
+				.url(WEBHOOK_URL)
+				.post(RequestBody.create(JSON, gson.toJson(payload)))
+				.build();
+
+			okHttpClient.newCall(request).enqueue(new Callback()
 			{
-				try (response)
+				@Override
+				public void onFailure(Call call, IOException e)
 				{
-					log.debug("GE trade submitted: itemId={} state={}", trade.getItemId(), trade.getState());
+					log.warn("Failed to submit GE trade", e);
 				}
-			}
-		});
+
+				@Override
+				public void onResponse(Call call, Response response)
+				{
+					try (response)
+					{
+						log.debug("GE trade submitted: itemId={} state={}", trade.getItemId(), trade.getState());
+					}
+				}
+			});
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to build GE trade request", e);
+		}
 	}
 }
