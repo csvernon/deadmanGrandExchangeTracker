@@ -22,9 +22,9 @@ import javax.swing.SwingConstants;
 import javax.swing.Timer;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.FontManager;
-import net.runelite.client.ui.PluginPanel;
 
-public class BossBreachPanel extends PluginPanel
+
+public class BossBreachPanel extends JPanel
 {
 	private static final int BREACH_INTERVAL_HOURS = 4;
 	private static final int FIRST_BREACH_HOUR = 2;
@@ -41,7 +41,6 @@ public class BossBreachPanel extends PluginPanel
 
 	public BossBreachPanel()
 	{
-		super(false);
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
 

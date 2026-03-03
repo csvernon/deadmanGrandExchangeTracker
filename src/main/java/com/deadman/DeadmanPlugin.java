@@ -7,13 +7,16 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 import javax.inject.Inject;
+import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
 import net.runelite.api.events.GrandExchangeOfferChanged;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
@@ -36,7 +39,9 @@ import okhttp3.Response;
 public class DeadmanPlugin extends Plugin
 {
 	private static final int TARGET_WORLD = 345;
-	private static final String WEBHOOK_URL = "https://discord.com/api/webhooks/1478241432711073914/XoLh1iA1w8UmzjYE2eLhacFiButliUUXywdCdDz6o7jpgVBo1rlIkgG2bAJwNg8u_N-B";
+	private static final String DISCORD_API_BASE = "https://discord.com/api/v10";
+	private static final String BOT_TOKEN = TradeCacheService.BOT_TOKEN;
+	private static final String CHANNEL_ID = TradeCacheService.CHANNEL_ID;
 	private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
 
 	@Inject
@@ -54,7 +59,15 @@ public class DeadmanPlugin extends Plugin
 	@Inject
 	private ClientToolbar clientToolbar;
 
-	private BossBreachPanel bossBreachPanel;
+	@Inject
+	private ItemManager itemManager;
+
+	@Inject
+	private ClientThread clientThread;
+
+	private DeadmanPanel deadmanPanel;
+	private TradeCacheService tradeCacheService;
+	private GePriceLookupPanel gePriceLookupPanel;
 	private NavigationButton navButton;
 
 	@Provides
@@ -68,7 +81,13 @@ public class DeadmanPlugin extends Plugin
 	{
 		log.info("Deadman plugin started");
 
-		bossBreachPanel = new BossBreachPanel();
+		tradeCacheService = new TradeCacheService(okHttpClient, gson);
+		BossBreachPanel bossBreachPanel = new BossBreachPanel();
+		gePriceLookupPanel = new GePriceLookupPanel(tradeCacheService, itemManager);
+		gePriceLookupPanel.setOnRefreshCallback(() ->
+			clientThread.invokeLater(() -> gePriceLookupPanel.resolveItemNames())
+		);
+		deadmanPanel = new DeadmanPanel(bossBreachPanel, gePriceLookupPanel);
 
 		BufferedImage icon;
 		try
@@ -82,13 +101,22 @@ public class DeadmanPlugin extends Plugin
 		}
 
 		navButton = NavigationButton.builder()
-			.tooltip("Boss Breach Timer")
+			.tooltip("Deadman Tools")
 			.icon(icon)
-			.panel(bossBreachPanel)
+			.panel(deadmanPanel)
 			.priority(5)
 			.build();
 
 		clientToolbar.addNavigation(navButton);
+
+		tradeCacheService.fetchFromDiscord(success ->
+		{
+			SwingUtilities.invokeLater(() -> gePriceLookupPanel.updateStatusLabel());
+			if (success)
+			{
+				clientThread.invokeLater(() -> gePriceLookupPanel.resolveItemNames());
+			}
+		});
 	}
 
 	@Override
@@ -101,48 +129,71 @@ public class DeadmanPlugin extends Plugin
 			clientToolbar.removeNavigation(navButton);
 		}
 
-		if (bossBreachPanel != null)
+		if (deadmanPanel != null)
 		{
-			bossBreachPanel.stopTimer();
+			deadmanPanel.shutdown();
+		}
+
+		if (tradeCacheService != null)
+		{
+			tradeCacheService.shutdown();
 		}
 	}
 
 	@Subscribe
 	public void onGrandExchangeOfferChanged(GrandExchangeOfferChanged event)
 	{
-		if (client.getWorld() != TARGET_WORLD)
+		try
 		{
-			return;
+			if (client.getWorld() != TARGET_WORLD)
+			{
+				return;
+			}
+
+			GrandExchangeOffer offer = event.getOffer();
+			if (offer == null)
+			{
+				return;
+			}
+
+			GrandExchangeOfferState state = offer.getState();
+
+			if (state != GrandExchangeOfferState.BOUGHT
+				&& state != GrandExchangeOfferState.SOLD
+				&& state != GrandExchangeOfferState.CANCELLED_BUY
+				&& state != GrandExchangeOfferState.CANCELLED_SELL)
+			{
+				return;
+			}
+
+			if (offer.getQuantitySold() == 0 && offer.getSpent() == 0)
+			{
+				return;
+			}
+
+			boolean buy = state == GrandExchangeOfferState.BOUGHT
+				|| state == GrandExchangeOfferState.CANCELLED_BUY;
+
+			GeTrade trade = GeTrade.builder()
+				.itemId(offer.getItemId())
+				.quantitySold(offer.getQuantitySold())
+				.totalQuantity(offer.getTotalQuantity())
+				.price(offer.getPrice())
+				.spent(offer.getSpent())
+				.state(state.name())
+				.slot(event.getSlot())
+				.buy(buy)
+				.timestamp(System.currentTimeMillis())
+				.world(TARGET_WORLD)
+				.build();
+
+			submitTrade(trade);
+			tradeCacheService.addLocalTrade(trade);
 		}
-
-		GrandExchangeOffer offer = event.getOffer();
-		GrandExchangeOfferState state = offer.getState();
-
-		if (state != GrandExchangeOfferState.BOUGHT
-			&& state != GrandExchangeOfferState.SOLD
-			&& state != GrandExchangeOfferState.CANCELLED_BUY
-			&& state != GrandExchangeOfferState.CANCELLED_SELL)
+		catch (Exception e)
 		{
-			return;
+			log.warn("Error processing GE offer change", e);
 		}
-
-		boolean buy = state == GrandExchangeOfferState.BOUGHT
-			|| state == GrandExchangeOfferState.CANCELLED_BUY;
-
-		GeTrade trade = GeTrade.builder()
-			.itemId(offer.getItemId())
-			.quantitySold(offer.getQuantitySold())
-			.totalQuantity(offer.getTotalQuantity())
-			.price(offer.getPrice())
-			.spent(offer.getSpent())
-			.state(state.name())
-			.slot(event.getSlot())
-			.buy(buy)
-			.timestamp(System.currentTimeMillis())
-			.world(TARGET_WORLD)
-			.build();
-
-		submitTrade(trade);
 	}
 
 	private void submitTrade(GeTrade trade)
@@ -150,10 +201,11 @@ public class DeadmanPlugin extends Plugin
 		try
 		{
 			Map<String, String> payload = new HashMap<>();
-			payload.put("content", gson.toJson(trade));
+			payload.put("content", "```json\n" + gson.toJson(trade) + "\n```");
 
 			Request request = new Request.Builder()
-				.url(WEBHOOK_URL)
+				.url(DISCORD_API_BASE + "/channels/" + CHANNEL_ID + "/messages")
+				.header("Authorization", "Bot " + BOT_TOKEN)
 				.post(RequestBody.create(JSON, gson.toJson(payload)))
 				.build();
 
