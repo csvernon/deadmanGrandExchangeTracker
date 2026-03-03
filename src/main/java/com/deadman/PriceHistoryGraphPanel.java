@@ -20,7 +20,7 @@ import net.runelite.client.ui.FontManager;
 public class PriceHistoryGraphPanel extends JPanel
 {
 	private static final int GRAPH_HEIGHT = 180;
-	private static final int LEFT_MARGIN = 60;
+	private static final int LEFT_MARGIN = 30;
 	private static final int RIGHT_MARGIN = 10;
 	private static final int TOP_MARGIN = 20;
 	private static final int BOTTOM_MARGIN = 30;
@@ -174,18 +174,17 @@ public class PriceHistoryGraphPanel extends JPanel
 			drawSeries(g2, buys, BUY_COLOR, plotLeft, plotTop, plotW, plotH, minTime, timeRange, minPrice, priceRange);
 			drawSeries(g2, sells, SELL_COLOR, plotLeft, plotTop, plotW, plotH, minTime, timeRange, minPrice, priceRange);
 
-			// Legend
-			int legendX = plotRight - 80;
-			int legendY = plotTop + 4;
+			// Legend (above plot area)
 			g2.setFont(smallFont);
+			int legendY = plotTop - 8;
 
 			g2.setColor(BUY_COLOR);
-			g2.fillOval(legendX, legendY, 8, 8);
-			g2.drawString("Buy", legendX + 12, legendY + 8);
+			g2.fillOval(plotLeft, legendY - 6, 8, 8);
+			g2.drawString("Buy", plotLeft + 12, legendY);
 
 			g2.setColor(SELL_COLOR);
-			g2.fillOval(legendX + 40, legendY, 8, 8);
-			g2.drawString("Sell", legendX + 52, legendY + 8);
+			g2.fillOval(plotLeft + 42, legendY - 6, 8, 8);
+			g2.drawString("Sell", plotLeft + 54, legendY);
 		}
 		finally
 		{
