@@ -49,7 +49,7 @@ public class BossBreachPanel extends JPanel
 		contentPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		contentPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
-		JLabel titleLabel = new JLabel("Boss Breach");
+		JLabel titleLabel = new JLabel("Breach Countdown");
 		titleLabel.setFont(FontManager.getRunescapeBoldFont().deriveFont(Font.BOLD, 16f));
 		titleLabel.setForeground(Color.WHITE);
 		titleLabel.setAlignmentX(CENTER_ALIGNMENT);

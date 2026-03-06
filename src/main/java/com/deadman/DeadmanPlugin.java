@@ -4,7 +4,9 @@ import com.google.gson.Gson;
 import com.google.inject.Provides;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
@@ -13,9 +15,12 @@ import net.runelite.api.Client;
 import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
 import net.runelite.api.events.GrandExchangeOfferChanged;
+import net.runelite.api.events.ScriptCallbackEvent;
+import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.EventBus.Subscriber;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
@@ -34,7 +39,7 @@ import okhttp3.Response;
 @PluginDescriptor(
 	name = "Deadman",
 	description = "Logs Grand Exchange transactions on world 345 to an external server. View data at https://dmmhs2.onrender.com/ge",
-	tags = {"grandexchange", "deadman", "logging"}
+	tags = {"grandexchange", "deadman", "logging", "price", "breach"}
 )
 public class DeadmanPlugin extends Plugin
 {
@@ -65,10 +70,15 @@ public class DeadmanPlugin extends Plugin
 	@Inject
 	private ClientThread clientThread;
 
+	@Inject
+	private EventBus eventBus;
+
 	private DeadmanPanel deadmanPanel;
 	private TradeCacheService tradeCacheService;
 	private GePriceLookupPanel gePriceLookupPanel;
 	private NavigationButton navButton;
+	private Subscriber geOfferSub;
+	private Subscriber scriptCallbackSub;
 
 	@Provides
 	DeadmanConfig provideConfig(ConfigManager configManager)
@@ -109,6 +119,9 @@ public class DeadmanPlugin extends Plugin
 
 		clientToolbar.addNavigation(navButton);
 
+		geOfferSub = eventBus.register(GrandExchangeOfferChanged.class, this::onGrandExchangeOfferChanged, 0);
+		scriptCallbackSub = eventBus.register(ScriptCallbackEvent.class, this::onScriptCallbackEvent, -1);
+
 		tradeCacheService.fetchFromDiscord(success ->
 		{
 			SwingUtilities.invokeLater(() -> gePriceLookupPanel.updateStatusLabel());
@@ -138,10 +151,91 @@ public class DeadmanPlugin extends Plugin
 		{
 			tradeCacheService.shutdown();
 		}
+
+		if (geOfferSub != null)
+		{
+			eventBus.unregister(geOfferSub);
+		}
+		if (scriptCallbackSub != null)
+		{
+			eventBus.unregister(scriptCallbackSub);
+		}
 	}
 
-	@Subscribe
-	public void onGrandExchangeOfferChanged(GrandExchangeOfferChanged event)
+	private void onScriptCallbackEvent(ScriptCallbackEvent event)
+	{
+		try
+		{
+			if (client.getWorld() != TARGET_WORLD)
+			{
+				return;
+			}
+
+			if (!"geBuyExamineText".equals(event.getEventName())
+				&& !"geSellExamineText".equals(event.getEventName()))
+			{
+				return;
+			}
+
+			int itemId = client.getVarpValue(VarPlayerID.TRADINGPOST_SEARCH);
+			if (itemId <= 0)
+			{
+				return;
+			}
+
+			List<GeTrade> trades = tradeCacheService.getTradesForItem(itemId);
+			if (trades == null || trades.isEmpty())
+			{
+				return;
+			}
+
+			GeTrade lastBuy = trades.stream()
+				.filter(GeTrade::isBuy)
+				.max(Comparator.comparingLong(GeTrade::getTimestamp))
+				.orElse(null);
+
+			GeTrade lastSell = trades.stream()
+				.filter(t -> !t.isBuy())
+				.max(Comparator.comparingLong(GeTrade::getTimestamp))
+				.orElse(null);
+
+			if (lastBuy == null && lastSell == null)
+			{
+				return;
+			}
+
+			StringBuilder sb = new StringBuilder();
+			if (lastBuy != null)
+			{
+				sb.append("Last Buy: ").append(GePriceLookupPanel.formatGp(GePriceLookupPanel.getActualPrice(lastBuy)));
+			}
+			if (lastSell != null)
+			{
+				if (sb.length() > 0)
+				{
+					sb.append(" | ");
+				}
+				sb.append("Last Sell: ").append(GePriceLookupPanel.formatGp(GePriceLookupPanel.getActualPrice(lastSell)));
+			}
+
+			Object[] stack = client.getObjectStack();
+			int sz = client.getObjectStackSize();
+			if (stack == null || sz < 1)
+			{
+				return;
+			}
+
+			Object existing = stack[sz - 1];
+			String existingText = existing instanceof String ? (String) existing : "";
+			stack[sz - 1] = existingText + "<br>" + sb;
+		}
+		catch (Exception e)
+		{
+			log.debug("Error injecting GE prices", e);
+		}
+	}
+
+	private void onGrandExchangeOfferChanged(GrandExchangeOfferChanged event)
 	{
 		try
 		{

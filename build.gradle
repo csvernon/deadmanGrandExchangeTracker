@@ -43,6 +43,17 @@ tasks.register('run', JavaExec) {
 	args "--developer-mode", "--debug"
 }
 
+jar {
+	archiveFileName.set('deadman.jar')
+	destinationDirectory.set(layout.buildDirectory.dir('libs'))
+}
+
+tasks.register('deploy', Copy) {
+	dependsOn jar
+	from jar.archiveFile
+	into "${System.getProperty('user.home')}/.runelite/sideloaded-plugins"
+}
+
 tasks.register('shadowJar', Jar) {
 	dependsOn configurations.testRuntimeClasspath
 	manifest {
