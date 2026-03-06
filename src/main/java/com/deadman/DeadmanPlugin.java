@@ -92,7 +92,7 @@ public class DeadmanPlugin extends Plugin
 		BufferedImage icon;
 		try
 		{
-			icon = ImageUtil.loadImageResource(getClass(), "/net/runelite/client/plugins/hiscore/deadman.png");
+			icon = ImageUtil.loadImageResource(getClass(), "/deadman.png");
 		}
 		catch (Exception e)
 		{
