@@ -396,6 +396,23 @@ public class GePriceLookupPanel extends JPanel
 		return card;
 	}
 
+	/**
+	 * Opens the detail view for an item by its ID.
+	 * Can be called externally to navigate directly to an item.
+	 */
+	public void lookupItem(int itemId)
+	{
+		try
+		{
+			String name = getItemName(itemId);
+			showItemDetail(itemId, name);
+		}
+		catch (Exception e)
+		{
+			// Don't let a lookup failure crash the client
+		}
+	}
+
 	private void showItemDetail(int itemId, String itemName)
 	{
 		detailPanel.removeAll();

@@ -16,4 +16,14 @@ public interface DeadmanConfig extends Config
 	{
 		return "https://dmmhs2.onrender.com/ge";
 	}
+
+	@ConfigItem(
+		keyName = "geAutoOpenPanel",
+		name = "Auto-open panel on GE lookup",
+		description = "Automatically switch to the plugin panel when looking up an item in the Grand Exchange"
+	)
+	default boolean geAutoOpenPanel()
+	{
+		return true;
+	}
 }

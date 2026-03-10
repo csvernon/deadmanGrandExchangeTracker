@@ -204,6 +204,28 @@ public class DeadmanPlugin extends Plugin
 				return;
 			}
 
+			// Open the plugin panel to show this item's detail
+			final int lookupItemId = itemId;
+			final NavigationButton btn = navButton;
+			final GePriceLookupPanel panel = gePriceLookupPanel;
+			if (config.geAutoOpenPanel() && btn != null && panel != null)
+			{
+				SwingUtilities.invokeLater(() ->
+				{
+					try
+					{
+						if (panel.isShowing())
+						{
+							panel.lookupItem(lookupItemId);
+						}
+					}
+					catch (Exception ex)
+					{
+						log.debug("Error opening GE lookup panel", ex);
+					}
+				});
+			}
+
 			StringBuilder sb = new StringBuilder();
 			if (lastBuy != null)
 			{
