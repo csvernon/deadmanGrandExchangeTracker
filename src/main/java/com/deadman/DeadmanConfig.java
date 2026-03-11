@@ -8,19 +8,9 @@ import net.runelite.client.config.ConfigItem;
 public interface DeadmanConfig extends Config
 {
 	@ConfigItem(
-		keyName = "dataUrl",
-		name = "DEADMAN GE TRACKER URL",
-		description = "URL where GE trade data is viewable"
-	)
-	default String dataUrl()
-	{
-		return "https://dmmhs2.onrender.com/ge";
-	}
-
-	@ConfigItem(
 		keyName = "geAutoOpenPanel",
-		name = "Auto-open panel on GE lookup",
-		description = "Automatically switch to the plugin panel when looking up an item in the Grand Exchange"
+		name = "Auto lookup items when viewing in ge",
+		description = "Automatically look up the item being viewed in Grand Exchange if the panel is open"
 	)
 	default boolean geAutoOpenPanel()
 	{
