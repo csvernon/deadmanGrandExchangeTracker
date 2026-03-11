@@ -213,6 +213,16 @@ public class TradeCacheService
 				return null;
 			}
 
+			// Use Discord message snowflake as the authoritative timestamp
+			// since the submitting client's clock may be wrong
+			try
+			{
+				String messageId = message.get("id").getAsString();
+				long snowflake = Long.parseLong(messageId);
+				trade.setTimestamp((snowflake >> 22) + 1420070400000L);
+			}
+			catch (Exception ignored) {}
+
 			// Only include completed trades, skip in-progress ones (BUYING, SELLING)
 			String state = trade.getState();
 			if (!state.equals("BOUGHT") && !state.equals("SOLD")

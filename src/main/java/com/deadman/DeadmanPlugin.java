@@ -14,9 +14,11 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
+import net.runelite.api.events.GameTick;
 import net.runelite.api.events.GrandExchangeOfferChanged;
 import net.runelite.api.events.ScriptCallbackEvent;
 import net.runelite.api.gameval.VarPlayerID;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.EventBus;
@@ -79,6 +81,8 @@ public class DeadmanPlugin extends Plugin
 	private NavigationButton navButton;
 	private Subscriber geOfferSub;
 	private Subscriber scriptCallbackSub;
+	private Subscriber gameTickSub;
+	private int lastGeItemId = -1;
 
 	@Provides
 	DeadmanConfig provideConfig(ConfigManager configManager)
@@ -121,6 +125,7 @@ public class DeadmanPlugin extends Plugin
 
 		geOfferSub = eventBus.register(GrandExchangeOfferChanged.class, this::onGrandExchangeOfferChanged, 0);
 		scriptCallbackSub = eventBus.register(ScriptCallbackEvent.class, this::onScriptCallbackEvent, -1);
+		gameTickSub = eventBus.register(GameTick.class, this::onGameTick, 0);
 
 		tradeCacheService.fetchFromDiscord(success ->
 		{
@@ -160,6 +165,11 @@ public class DeadmanPlugin extends Plugin
 		{
 			eventBus.unregister(scriptCallbackSub);
 		}
+		if (gameTickSub != null)
+		{
+			eventBus.unregister(gameTickSub);
+		}
+		lastGeItemId = -1;
 	}
 
 	private void onScriptCallbackEvent(ScriptCallbackEvent event)
@@ -204,27 +214,7 @@ public class DeadmanPlugin extends Plugin
 				return;
 			}
 
-			// Open the plugin panel to show this item's detail
-			final int lookupItemId = itemId;
-			final NavigationButton btn = navButton;
-			final GePriceLookupPanel panel = gePriceLookupPanel;
-			if (config.geAutoOpenPanel() && btn != null && panel != null)
-			{
-				SwingUtilities.invokeLater(() ->
-				{
-					try
-					{
-						if (panel.isShowing())
-						{
-							panel.lookupItem(lookupItemId);
-						}
-					}
-					catch (Exception ex)
-					{
-						log.debug("Error opening GE lookup panel", ex);
-					}
-				});
-			}
+			openPanelForItem(itemId);
 
 			StringBuilder sb = new StringBuilder();
 			if (lastBuy != null)
@@ -255,6 +245,105 @@ public class DeadmanPlugin extends Plugin
 		{
 			log.debug("Error injecting GE prices", e);
 		}
+	}
+
+	private static final int GE_WIDGET_GROUP = 465;
+
+	private void onGameTick(GameTick event)
+	{
+		try
+		{
+			if (client.getWorld() != TARGET_WORLD)
+			{
+				return;
+			}
+
+			// Check TRADINGPOST_SEARCH varp (works for buy/sell search)
+			int itemId = client.getVarpValue(VarPlayerID.TRADINGPOST_SEARCH);
+
+			// If varp not set, scan GE widget children for an item being displayed
+			if (itemId <= 0)
+			{
+				itemId = getItemFromGeWidget();
+			}
+
+			if (itemId <= 0)
+			{
+				lastGeItemId = -1;
+				return;
+			}
+
+			if (itemId != lastGeItemId)
+			{
+				lastGeItemId = itemId;
+				openPanelForItem(itemId);
+			}
+		}
+		catch (Exception e)
+		{
+			log.debug("Error checking GE item on game tick", e);
+		}
+	}
+
+	private static final int GE_OFFER_DETAIL_CHILD = 15;
+	private static final int GE_OFFER_DETAIL_ITEM_INDEX = 7;
+
+	private int getItemFromGeWidget()
+	{
+		try
+		{
+			// Widget 465:15 is the offer detail view, dyn[7] holds the item
+			Widget detailWidget = client.getWidget(GE_WIDGET_GROUP, GE_OFFER_DETAIL_CHILD);
+			if (detailWidget == null || detailWidget.isHidden())
+			{
+				return -1;
+			}
+
+			Widget[] children = detailWidget.getDynamicChildren();
+			if (children != null && children.length > GE_OFFER_DETAIL_ITEM_INDEX)
+			{
+				Widget itemWidget = children[GE_OFFER_DETAIL_ITEM_INDEX];
+				if (itemWidget != null && itemWidget.getItemId() > 0)
+				{
+					return itemWidget.getItemId();
+				}
+			}
+		}
+		catch (Exception e)
+		{
+			log.debug("Error reading GE widget", e);
+		}
+		return -1;
+	}
+
+	private void openPanelForItem(int itemId)
+	{
+		if (!config.geAutoOpenPanel())
+		{
+			return;
+		}
+
+		final NavigationButton btn = navButton;
+		final GePriceLookupPanel panel = gePriceLookupPanel;
+		if (btn == null || panel == null)
+		{
+			return;
+		}
+
+		SwingUtilities.invokeLater(() ->
+		{
+			try
+			{
+				if (panel.isShowing())
+				{
+					panel.lookupItem(itemId);
+				}
+			}
+			catch (Exception ex)
+			{
+				log.debug("Error opening GE lookup panel", ex);
+			}
+		});
 	}
 
 	private void onGrandExchangeOfferChanged(GrandExchangeOfferChanged event)
