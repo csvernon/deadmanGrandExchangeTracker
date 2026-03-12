@@ -1,8 +1,7 @@
 package com.deadman;
 
 import java.awt.BorderLayout;
-import java.awt.Desktop;
-import java.net.URI;
+import net.runelite.client.util.LinkBrowser;
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
@@ -44,16 +43,7 @@ public class DeadmanPanel extends PluginPanel
 		JButton discordButton = new JButton("Join the Deadman Discord");
 		discordButton.setAlignmentX(CENTER_ALIGNMENT);
 		discordButton.addActionListener(e ->
-		{
-			try
-			{
-				Desktop.getDesktop().browse(new URI("https://discord.gg/wFbewDmCbp"));
-			}
-			catch (Exception ex)
-			{
-				log.debug("Failed to open Discord link", ex);
-			}
-		});
+			LinkBrowser.browse("https://discord.gg/wFbewDmCbp"));
 
 		// Bottom panel wrapping breach timer and discord link
 		JPanel bottomPanel = new JPanel();
