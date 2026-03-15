@@ -92,7 +92,7 @@ public class GePriceLookupPanel extends JPanel
 
 		JButton refreshButton = new JButton("Refresh");
 		refreshButton.setAlignmentX(CENTER_ALIGNMENT);
-		refreshButton.addActionListener(e -> refreshData());
+		refreshButton.addActionListener(e -> fetchNewTrades());
 
 		topPanel.add(titleLabel);
 		topPanel.add(Box.createRigidArea(new Dimension(0, 8)));
