@@ -4,10 +4,21 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.file.Files;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.StandardCopyOption;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ScheduledExecutorService;
@@ -31,6 +42,11 @@ public class TradeCacheService
 	static final String CHANNEL_ID = xorDecode(
 		"6b6e6d62686e6a62686c696b6b6a6f696f6f69");
 	private static final String DISCORD_API_BASE = "https://discord.com/api/v10";
+	private static final File CACHE_FILE = new File(new File(new File(System.getProperty("user.home"), ".runelite"), "cache"), "deadman-helper/trades-cache.json");
+	private static final File LOCK_FILE = new File(CACHE_FILE.getParentFile(), "trades-cache.lock");
+	private static final long MIN_RATE_LIMIT_DELAY_MS = 5500;
+	private static final long MAX_RATE_LIMIT_DELAY_MS = 5500;
+	private static final long CACHE_RELOAD_INTERVAL_MS = TimeUnit.SECONDS.toMillis(15);
 
 	private static String xorDecode(String hex)
 	{
@@ -46,10 +62,20 @@ public class TradeCacheService
 	private String oldestMessageId = null;
 	private String newestMessageId = null;
 	private boolean initialFetchDone = false;
+	private boolean backfillComplete = false;
+	private boolean backfillInProgress = false;
+	private boolean syncOwner = false;
+	private long lastCacheModified = 0;
+	private long lastCacheSize = 0;
+	private long lastNewTradeFetchAttempt = 0;
+	private int consecutiveRateLimits = 0;
 
 	private final OkHttpClient httpClient;
 	private final Gson gson;
 	private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+	private RandomAccessFile lockFile;
+	private FileChannel lockChannel;
+	private FileLock cacheLock;
 
 	public TradeCacheService(OkHttpClient httpClient, Gson gson)
 	{
@@ -60,17 +86,212 @@ public class TradeCacheService
 	public void addLocalTrade(GeTrade trade)
 	{
 		trades.add(0, trade);
+		saveCache();
 	}
 
 	public void fetchFromDiscord(Consumer<Boolean> onComplete)
 	{
+		syncOwner = acquireSyncLock();
+		if (loadCache())
+		{
+			log.info("Loaded {} Deadman trades from local cache", trades.size());
+			initialFetchDone = true;
+			onComplete.accept(true);
+			if (!syncOwner)
+			{
+				log.info("Another Deadman client is syncing Discord history; watching local cache");
+				startCacheWatcher(onComplete);
+				return;
+			}
+
+			if (!backfillComplete && oldestMessageId != null)
+			{
+				fetchPage(onComplete);
+				return;
+			}
+
+			fetchNewTrades(onComplete);
+			return;
+		}
+
+		initialFetchDone = false;
+		if (syncOwner)
+		{
+			fetchPage(onComplete);
+		}
+		else
+		{
+			log.info("Another Deadman client is syncing Discord history; waiting for local cache");
+			startCacheWatcher(onComplete);
+			onComplete.accept(false);
+		}
+	}
+
+	private boolean loadCache()
+	{
+		if (!CACHE_FILE.isFile())
+		{
+			return false;
+		}
+
+		try (FileReader reader = new FileReader(CACHE_FILE))
+		{
+			CacheFile cache = gson.fromJson(reader, CacheFile.class);
+			if (cache == null || cache.trades == null)
+			{
+				return false;
+			}
+
+			trades.clear();
+			trades.addAll(cache.trades);
+			newestMessageId = cache.newestMessageId;
+			oldestMessageId = cache.oldestMessageId;
+			backfillComplete = cache.backfillComplete;
+			rememberCacheMetadata();
+			return newestMessageId != null || !trades.isEmpty();
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to load Deadman trade cache", e);
+			return false;
+		}
+	}
+
+	private void saveCache()
+	{
+		try
+		{
+			File parent = CACHE_FILE.getParentFile();
+			if (!parent.isDirectory() && !parent.mkdirs())
+			{
+				return;
+			}
+
+			CacheFile cache = new CacheFile();
+			cache.newestMessageId = newestMessageId;
+			cache.oldestMessageId = oldestMessageId;
+			cache.backfillComplete = backfillComplete;
+			cache.trades = new ArrayList<>(trades);
+
+			File temp = File.createTempFile("trades-cache-", ".json", parent);
+			try (FileWriter writer = new FileWriter(temp))
+			{
+				gson.toJson(cache, writer);
+			}
+			try
+			{
+				Files.move(temp.toPath(), CACHE_FILE.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+			}
+			catch (AtomicMoveNotSupportedException e)
+			{
+				Files.move(temp.toPath(), CACHE_FILE.toPath(), StandardCopyOption.REPLACE_EXISTING);
+			}
+			rememberCacheMetadata();
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to save Deadman trade cache", e);
+		}
+	}
+
+	private boolean acquireSyncLock()
+	{
+		try
+		{
+			File parent = CACHE_FILE.getParentFile();
+			if (!parent.isDirectory() && !parent.mkdirs())
+			{
+				return false;
+			}
+
+			lockFile = new RandomAccessFile(LOCK_FILE, "rw");
+			lockChannel = lockFile.getChannel();
+			cacheLock = lockChannel.tryLock();
+			return cacheLock != null;
+		}
+		catch (Exception e)
+		{
+			log.debug("Unable to acquire Deadman cache sync lock", e);
+			closeLock();
+			return false;
+		}
+	}
+
+	private void startCacheWatcher(Consumer<Boolean> onComplete)
+	{
+		scheduler.scheduleWithFixedDelay(() ->
+		{
+			try
+			{
+				if (!CACHE_FILE.isFile())
+				{
+					return;
+				}
+
+				long modified = CACHE_FILE.lastModified();
+				long size = CACHE_FILE.length();
+				if (modified == lastCacheModified && size == lastCacheSize)
+				{
+					return;
+				}
+
+				if (loadCache())
+				{
+					initialFetchDone = true;
+					log.info("Reloaded {} Deadman trades from local cache", trades.size());
+					onComplete.accept(true);
+				}
+			}
+			catch (Exception e)
+			{
+				log.warn("Failed to reload Deadman trade cache", e);
+			}
+		}, CACHE_RELOAD_INTERVAL_MS, CACHE_RELOAD_INTERVAL_MS, TimeUnit.MILLISECONDS);
+	}
+
+	private void rememberCacheMetadata()
+	{
+		if (CACHE_FILE.isFile())
+		{
+			lastCacheModified = CACHE_FILE.lastModified();
+			lastCacheSize = CACHE_FILE.length();
+		}
+	}
+
+	private void mergeTrades(List<GeTrade> parsed, boolean newestFirst)
+	{
+		Map<String, GeTrade> merged = new LinkedHashMap<>();
+		if (newestFirst)
+		{
+			for (GeTrade trade : parsed)
+			{
+				merged.put(tradeKey(trade), trade);
+			}
+		}
+		for (GeTrade trade : trades)
+		{
+			merged.putIfAbsent(tradeKey(trade), trade);
+		}
+		if (!newestFirst)
+		{
+			for (GeTrade trade : parsed)
+			{
+				merged.putIfAbsent(tradeKey(trade), trade);
+			}
+		}
 		trades.clear();
-		oldestMessageId = null;
-		fetchPage(onComplete);
+		trades.addAll(merged.values());
+	}
+
+	private static String tradeKey(GeTrade trade)
+	{
+		return trade.getItemId() + ":" + trade.getQuantitySold() + ":" + trade.getTotalQuantity() + ":" + trade.getPrice() + ":" +
+			trade.getSpent() + ":" + trade.getState() + ":" + trade.getSlot() + ":" + trade.isBuy() + ":" + trade.getTimestamp() + ":" + trade.getWorld();
 	}
 
 	private void fetchPage(Consumer<Boolean> onComplete)
 	{
+		backfillInProgress = true;
 		String url = DISCORD_API_BASE + "/channels/" + CHANNEL_ID + "/messages?limit=100";
 		if (oldestMessageId != null)
 		{
@@ -90,6 +311,7 @@ public class TradeCacheService
 			{
 				log.warn("Failed to fetch trades from Discord", e);
 				initialFetchDone = true;
+				backfillInProgress = false;
 				onComplete.accept(false);
 			}
 
@@ -100,25 +322,18 @@ public class TradeCacheService
 				{
 					if (response.code() == 429)
 					{
-						long delayMs;
-						try
-						{
-							String retryAfter = response.header("Retry-After", "2");
-							delayMs = (long) (Double.parseDouble(retryAfter) * 1000) + 500;
-						}
-						catch (NumberFormatException e)
-						{
-							delayMs = 5000;
-						}
-						log.debug("Rate limited, retrying in {}ms", delayMs);
+						long delayMs = getRateLimitDelayMs(response);
+						log.warn("Rate limited while fetching Deadman trades, retrying in {}ms", delayMs);
 						scheduler.schedule(() -> fetchPage(onComplete), delayMs, TimeUnit.MILLISECONDS);
 						return;
 					}
+					consecutiveRateLimits = 0;
 
 					if (!response.isSuccessful())
 					{
 						log.warn("Discord API returned status {}", response.code());
 						initialFetchDone = true;
+						backfillInProgress = false;
 						onComplete.accept(false);
 						return;
 					}
@@ -126,6 +341,7 @@ public class TradeCacheService
 					if (response.body() == null)
 					{
 						initialFetchDone = true;
+						backfillInProgress = false;
 						onComplete.accept(false);
 						return;
 					}
@@ -135,7 +351,10 @@ public class TradeCacheService
 
 					if (messages == null || messages.size() == 0)
 					{
+						backfillComplete = true;
+						saveCache();
 						initialFetchDone = true;
+						backfillInProgress = false;
 						onComplete.accept(true);
 						return;
 					}
@@ -149,7 +368,7 @@ public class TradeCacheService
 							parsed.add(trade);
 						}
 					}
-					trades.addAll(parsed);
+					mergeTrades(parsed, false);
 
 					// Track newest message ID (first in array = newest)
 					if (newestMessageId == null)
@@ -160,6 +379,9 @@ public class TradeCacheService
 					// Track oldest message ID for pagination
 					JsonObject lastMessage = messages.get(messages.size() - 1).getAsJsonObject();
 					oldestMessageId = lastMessage.get("id").getAsString();
+					saveCache();
+					log.info("Fetched {} Discord messages, cached {} Deadman trades so far", messages.size(), trades.size());
+					onComplete.accept(true);
 
 					if (messages.size() == 100)
 					{
@@ -167,7 +389,10 @@ public class TradeCacheService
 					}
 					else
 					{
+						backfillComplete = true;
+						saveCache();
 						initialFetchDone = true;
+						backfillInProgress = false;
 						onComplete.accept(true);
 					}
 				}
@@ -175,6 +400,7 @@ public class TradeCacheService
 				{
 					log.warn("Error processing Discord messages", e);
 					initialFetchDone = true;
+					backfillInProgress = false;
 					onComplete.accept(false);
 				}
 			}
@@ -263,6 +489,26 @@ public class TradeCacheService
 
 	public void fetchNewTrades(Consumer<Boolean> onComplete)
 	{
+		if (!syncOwner)
+		{
+			onComplete.accept(false);
+			return;
+		}
+
+		if (backfillInProgress || !initialFetchDone)
+		{
+			onComplete.accept(false);
+			return;
+		}
+
+		long now = System.currentTimeMillis();
+		if (now - lastNewTradeFetchAttempt < TimeUnit.MINUTES.toMillis(1))
+		{
+			onComplete.accept(false);
+			return;
+		}
+		lastNewTradeFetchAttempt = now;
+
 		if (newestMessageId == null)
 		{
 			onComplete.accept(false);
@@ -293,9 +539,14 @@ public class TradeCacheService
 				{
 					if (response.code() == 429 || !response.isSuccessful() || response.body() == null)
 					{
+						if (response.code() == 429)
+						{
+							log.warn("Rate limited while checking for new Deadman trades; skipping this refresh");
+						}
 						onComplete.accept(false);
 						return;
 					}
+					consecutiveRateLimits = 0;
 
 					String body = response.body().string();
 					JsonArray messages = gson.fromJson(body, JsonArray.class);
@@ -319,10 +570,8 @@ public class TradeCacheService
 						}
 					}
 
-					if (!parsed.isEmpty())
-					{
-						trades.addAll(0, parsed);
-					}
+					mergeTrades(parsed, true);
+					saveCache();
 
 					onComplete.accept(true);
 				}
@@ -347,6 +596,73 @@ public class TradeCacheService
 
 	public void shutdown()
 	{
+		if (syncOwner)
+		{
+			saveCache();
+		}
 		scheduler.shutdownNow();
+		closeLock();
+	}
+
+	private void closeLock()
+	{
+		try
+		{
+			if (cacheLock != null)
+			{
+				cacheLock.release();
+			}
+		}
+		catch (Exception ignored) {}
+		try
+		{
+			if (lockChannel != null)
+			{
+				lockChannel.close();
+			}
+		}
+		catch (Exception ignored) {}
+		try
+		{
+			if (lockFile != null)
+			{
+				lockFile.close();
+			}
+		}
+		catch (Exception ignored) {}
+		cacheLock = null;
+		lockChannel = null;
+		lockFile = null;
+	}
+
+	private long getRateLimitDelayMs(Response response)
+	{
+		long discordDelayMs = 5000;
+		try
+		{
+			String retryAfter = response.header("Retry-After", "5");
+			if (response.body() != null)
+			{
+				JsonObject rateLimit = gson.fromJson(response.body().string(), JsonObject.class);
+				if (rateLimit != null && rateLimit.has("retry_after"))
+				{
+					retryAfter = rateLimit.get("retry_after").getAsString();
+				}
+			}
+			discordDelayMs = (long) (Double.parseDouble(retryAfter) * 1000) + 500;
+		}
+		catch (Exception ignored) {}
+
+		consecutiveRateLimits++;
+		long localBackoffMs = MIN_RATE_LIMIT_DELAY_MS * (1L << Math.min(consecutiveRateLimits - 1, 3));
+		return Math.min(MAX_RATE_LIMIT_DELAY_MS, Math.max(discordDelayMs, localBackoffMs));
+	}
+
+	private static class CacheFile
+	{
+		private String newestMessageId;
+		private String oldestMessageId;
+		private boolean backfillComplete;
+		private List<GeTrade> trades;
 	}
 }
