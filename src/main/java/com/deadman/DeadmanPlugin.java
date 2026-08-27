@@ -2,6 +2,8 @@ package com.deadman;
 
 import com.google.gson.Gson;
 import com.google.inject.Provides;
+import java.awt.Color;
+import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.util.Comparator;
@@ -107,11 +109,15 @@ public class DeadmanPlugin extends Plugin
 		try
 		{
 			icon = ImageUtil.loadImageResource(getClass(), "/deadman.png");
+			if (icon == null)
+			{
+				icon = createFallbackIcon();
+			}
 		}
 		catch (Exception e)
 		{
 			log.warn("Failed to load deadman icon, using fallback", e);
-			icon = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+			icon = createFallbackIcon();
 		}
 
 		navButton = NavigationButton.builder()
@@ -436,5 +442,23 @@ public class DeadmanPlugin extends Plugin
 		{
 			log.warn("Failed to build GE trade request", e);
 		}
+	}
+
+	private static BufferedImage createFallbackIcon()
+	{
+		BufferedImage image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+		Graphics2D graphics = image.createGraphics();
+		try
+		{
+			graphics.setColor(new Color(95, 30, 30));
+			graphics.fillOval(1, 1, 14, 14);
+			graphics.setColor(new Color(240, 190, 80));
+			graphics.drawString("D", 4, 12);
+		}
+		finally
+		{
+			graphics.dispose();
+		}
+		return image;
 	}
 }
