@@ -462,21 +462,21 @@ public class GePriceLookupPanel extends JPanel
 		// Summary stats
 		long buyCount = trades.stream().filter(GeTrade::isBuy).count();
 		long sellCount = trades.stream().filter(t -> !t.isBuy()).count();
-		int avgBuy = 0;
+		long avgBuy = 0;
 		if (buyCount > 0)
 		{
 			long buySum = trades.stream().filter(GeTrade::isBuy)
 				.mapToLong(t -> (long) getActualPrice(t))
 				.sum();
-			avgBuy = (int) (buySum / buyCount);
+			avgBuy = buySum / buyCount;
 		}
-		int avgSell = 0;
+		long avgSell = 0;
 		if (sellCount > 0)
 		{
 			long sellSum = trades.stream().filter(t -> !t.isBuy())
 				.mapToLong(t -> (long) getActualPrice(t))
 				.sum();
-			avgSell = (int) (sellSum / sellCount);
+			avgSell = sellSum / sellCount;
 		}
 
 		JPanel statsPanel = new JPanel(new GridLayout(0, 1, 0, 2));
@@ -624,7 +624,7 @@ public class GePriceLookupPanel extends JPanel
 		return itemNameCache.getOrDefault(itemId, "Item #" + itemId);
 	}
 
-	static int getActualPrice(GeTrade trade)
+	static long getActualPrice(GeTrade trade)
 	{
 		if (trade.getQuantitySold() > 0)
 		{
@@ -633,7 +633,7 @@ public class GePriceLookupPanel extends JPanel
 		return trade.getPrice();
 	}
 
-	static String formatGp(int price)
+	static String formatGp(long price)
 	{
 		if (price >= 10_000_000)
 		{

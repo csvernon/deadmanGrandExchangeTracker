@@ -96,10 +96,10 @@ public class PriceHistoryGraphPanel extends JPanel
 
 			// Compute ranges
 			long minTime = Long.MAX_VALUE, maxTime = Long.MIN_VALUE;
-			int minPrice = Integer.MAX_VALUE, maxPrice = Integer.MIN_VALUE;
+			long minPrice = Long.MAX_VALUE, maxPrice = Long.MIN_VALUE;
 			for (GeTrade t : trades)
 			{
-				int price = GePriceLookupPanel.getActualPrice(t);
+				long price = GePriceLookupPanel.getActualPrice(t);
 				long time = t.getTimestamp();
 				if (time < minTime) minTime = time;
 				if (time > maxTime) maxTime = time;
@@ -117,12 +117,12 @@ public class PriceHistoryGraphPanel extends JPanel
 				minPrice = Math.max(0, minPrice - 100);
 				maxPrice += 100;
 			}
-			int pricePad = Math.max(1, (maxPrice - minPrice) / 20);
+			long pricePad = Math.max(1, (maxPrice - minPrice) / 20);
 			minPrice = Math.max(0, minPrice - pricePad);
 			maxPrice += pricePad;
 
 			long timeRange = maxTime - minTime;
-			int priceRange = maxPrice - minPrice;
+			long priceRange = maxPrice - minPrice;
 
 			if (timeRange <= 0 || priceRange <= 0)
 			{
@@ -142,7 +142,7 @@ public class PriceHistoryGraphPanel extends JPanel
 				g2.setColor(GRID_COLOR);
 				g2.drawLine(plotLeft, y, plotRight, y);
 
-				int priceAtTick = minPrice + (int) ((long) i * priceRange / Y_TICK_COUNT);
+				long priceAtTick = minPrice + (long) ((long) i * priceRange / Y_TICK_COUNT);
 				String label = formatAxisPrice(priceAtTick);
 				g2.setColor(LABEL_COLOR);
 				g2.drawString(label, plotLeft - fm.stringWidth(label) - 6, y + fm.getAscent() / 2);
@@ -206,9 +206,9 @@ public class PriceHistoryGraphPanel extends JPanel
 	}
 
 	private int[] toPoint(GeTrade t, int plotLeft, int plotTop, int plotW, int plotH,
-		long minTime, long timeRange, int minPrice, int priceRange)
+		long minTime, long timeRange, long minPrice, long priceRange)
 	{
-		int price = GePriceLookupPanel.getActualPrice(t);
+		long price = GePriceLookupPanel.getActualPrice(t);
 		long time = t.getTimestamp();
 		int x = plotLeft + (int) ((time - minTime) * plotW / timeRange);
 		int y = plotTop + plotH - (int) ((long) (price - minPrice) * plotH / priceRange);
@@ -219,7 +219,7 @@ public class PriceHistoryGraphPanel extends JPanel
 
 	private void drawSeriesFill(Graphics2D g2, List<GeTrade> series, Color lineColor, Color fillColor,
 		int plotLeft, int plotTop, int plotW, int plotH, int plotBottom,
-		long minTime, long timeRange, int minPrice, int priceRange)
+		long minTime, long timeRange, long minPrice, long priceRange)
 	{
 		if (series.size() < 2)
 		{
@@ -246,7 +246,7 @@ public class PriceHistoryGraphPanel extends JPanel
 
 	private void drawSeriesLine(Graphics2D g2, List<GeTrade> series, Color color,
 		int plotLeft, int plotTop, int plotW, int plotH,
-		long minTime, long timeRange, int minPrice, int priceRange)
+		long minTime, long timeRange, long minPrice, long priceRange)
 	{
 		if (series.isEmpty())
 		{
@@ -316,7 +316,7 @@ public class PriceHistoryGraphPanel extends JPanel
 		}
 	}
 
-	private static String formatAxisPrice(int price)
+	private static String formatAxisPrice(long price)
 	{
 		if (price >= 10_000_000)
 		{
