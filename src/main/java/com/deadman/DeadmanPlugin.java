@@ -93,11 +93,11 @@ public class DeadmanPlugin extends Plugin
 	}
 
 	@Override
-	protected void startUp()
+	protected void startUp() throws IOException
 	{
 		log.info("Deadman plugin started");
 
-		tradeCacheService = new TradeCacheService(okHttpClient, gson);
+		tradeCacheService = new TradeCacheService(okHttpClient, gson, getPluginDirectory());
 		BossBreachPanel bossBreachPanel = new BossBreachPanel();
 		gePriceLookupPanel = new GePriceLookupPanel(tradeCacheService, itemManager);
 		gePriceLookupPanel.setOnRefreshCallback(() ->

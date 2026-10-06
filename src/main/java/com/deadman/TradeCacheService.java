@@ -4,14 +4,12 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
+import java.io.Reader;
+import java.io.Writer;
 import java.io.IOException;
-import java.io.RandomAccessFile;
-import java.nio.file.Files;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.util.ArrayList;
@@ -21,12 +19,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.util.Filepath;
 import okhttp3.Call;
 import okhttp3.Callback;
 import okhttp3.OkHttpClient;
@@ -42,8 +40,8 @@ public class TradeCacheService
 	static final String CHANNEL_ID = xorDecode(
 		"6b6e6d62686e6a62686c696b6b6a6f696f6f69");
 	private static final String DISCORD_API_BASE = "https://discord.com/api/v10";
-	private final File CACHE_FILE;
-	private final File LOCK_FILE;
+	private final Filepath CACHE_FILE;
+	private final Filepath LOCK_FILE;
 	private static final long MIN_RATE_LIMIT_DELAY_MS = 5500;
 	private static final long MAX_RATE_LIMIT_DELAY_MS = 60000;
 	private final long cacheReloadIntervalMs;
@@ -72,25 +70,26 @@ public class TradeCacheService
 
 	private final OkHttpClient httpClient;
 	private final Gson gson;
-	private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-	private RandomAccessFile lockFile;
+	private final ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1);
 	private FileChannel lockChannel;
 	private FileLock cacheLock;
 	private volatile boolean stopped;
 	private final java.util.Set<Call> activeCalls = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-	public TradeCacheService(OkHttpClient httpClient, Gson gson)
+	public TradeCacheService(OkHttpClient httpClient, Gson gson, Filepath directory)
 	{
-		this(httpClient, gson, new File(net.runelite.client.RuneLite.CACHE_DIR, "deadman-helper/trades-cache.json"), TimeUnit.SECONDS.toMillis(15));
+		this(httpClient, gson, directory.join("trades-cache.json"), TimeUnit.SECONDS.toMillis(15));
 	}
 
-	TradeCacheService(OkHttpClient httpClient, Gson gson, File cacheFile, long reloadIntervalMs)
+	TradeCacheService(OkHttpClient httpClient, Gson gson, Filepath cacheFile, long reloadIntervalMs)
 	{
 		this.httpClient = httpClient;
 		this.gson = gson;
 		this.CACHE_FILE = cacheFile;
-		this.LOCK_FILE = new File(cacheFile.getParentFile(), "trades-cache.lock");
+		this.LOCK_FILE = cacheFile.getParent().join("trades-cache.lock");
 		this.cacheReloadIntervalMs = reloadIntervalMs;
+		scheduler.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+		scheduler.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
 	}
 
 	public void addLocalTrade(GeTrade trade)
@@ -167,7 +166,7 @@ public class TradeCacheService
 			return false;
 		}
 
-		try (FileReader reader = new FileReader(CACHE_FILE))
+		try (Reader reader = CACHE_FILE.openBufferedReader())
 		{
 			CacheFile cache = gson.fromJson(reader, CacheFile.class);
 			if (cache == null || cache.trades == null)
@@ -198,11 +197,8 @@ public class TradeCacheService
 		}
 		try
 		{
-			File parent = CACHE_FILE.getParentFile();
-			if (!parent.isDirectory() && !parent.mkdirs())
-			{
-				return;
-			}
+			Filepath parent = CACHE_FILE.getParent();
+			parent.createDirectories();
 
 			CacheFile cache = new CacheFile();
 			cache.newestMessageId = newestMessageId;
@@ -210,18 +206,25 @@ public class TradeCacheService
 			cache.backfillComplete = backfillComplete;
 			cache.trades = new ArrayList<>(trades);
 
-			File temp = File.createTempFile("trades-cache-", ".json", parent);
-			try (FileWriter writer = new FileWriter(temp))
-			{
-				gson.toJson(cache, writer);
-			}
+			Filepath temp = parent.createTempFile("trades-cache-", ".json");
 			try
 			{
-				Files.move(temp.toPath(), CACHE_FILE.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+				try (Writer writer = temp.openBufferedWriter())
+				{
+					gson.toJson(cache, writer);
+				}
+				try
+				{
+					temp.moveTo(CACHE_FILE, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+				}
+				catch (AtomicMoveNotSupportedException e)
+				{
+					temp.moveTo(CACHE_FILE, StandardCopyOption.REPLACE_EXISTING);
+				}
 			}
-			catch (AtomicMoveNotSupportedException e)
+			finally
 			{
-				Files.move(temp.toPath(), CACHE_FILE.toPath(), StandardCopyOption.REPLACE_EXISTING);
+				temp.deleteIfExists();
 			}
 			rememberCacheMetadata();
 		}
@@ -235,14 +238,8 @@ public class TradeCacheService
 	{
 		try
 		{
-			File parent = CACHE_FILE.getParentFile();
-			if (!parent.isDirectory() && !parent.mkdirs())
-			{
-				return false;
-			}
-
-			lockFile = new RandomAccessFile(LOCK_FILE, "rw");
-			lockChannel = lockFile.getChannel();
+			CACHE_FILE.getParent().createDirectories();
+			lockChannel = LOCK_FILE.openFileChannel(StandardOpenOption.CREATE, StandardOpenOption.WRITE);
 			cacheLock = lockChannel.tryLock();
 			if (cacheLock == null)
 			{
@@ -282,8 +279,8 @@ public class TradeCacheService
 					return;
 				}
 
-				long modified = CACHE_FILE.lastModified();
-				long size = CACHE_FILE.length();
+				long modified = CACHE_FILE.getLastModifiedTime().toMillis();
+				long size = CACHE_FILE.size();
 				if (modified == lastCacheModified && size == lastCacheSize)
 				{
 					return;
@@ -303,12 +300,12 @@ public class TradeCacheService
 		}, cacheReloadIntervalMs, cacheReloadIntervalMs, TimeUnit.MILLISECONDS);
 	}
 
-	private void rememberCacheMetadata()
+	private void rememberCacheMetadata() throws IOException
 	{
 		if (CACHE_FILE.isFile())
 		{
-			lastCacheModified = CACHE_FILE.lastModified();
-			lastCacheSize = CACHE_FILE.length();
+			lastCacheModified = CACHE_FILE.getLastModifiedTime().toMillis();
+			lastCacheSize = CACHE_FILE.size();
 		}
 	}
 
@@ -686,20 +683,14 @@ public class TradeCacheService
 		return initialFetchDone;
 	}
 
-	public void shutdown()
+	public synchronized void shutdown()
 	{
+		if (stopped) return;
 		stopped = true;
 		for (Call call : activeCalls) call.cancel();
-		scheduler.shutdownNow();
-		try
-		{
-			scheduler.awaitTermination(2, TimeUnit.SECONDS);
-		}
-		catch (InterruptedException e)
-		{
-			Thread.currentThread().interrupt();
-		}
-		closeLock();
+		// Release ownership only after any running cache operation finishes.
+		scheduler.execute(this::closeLock);
+		scheduler.shutdown();
 	}
 
 	private void enqueue(Request request, Callback callback)
@@ -752,17 +743,8 @@ public class TradeCacheService
 			}
 		}
 		catch (Exception ignored) {}
-		try
-		{
-			if (lockFile != null)
-			{
-				lockFile.close();
-			}
-		}
-		catch (Exception ignored) {}
 		cacheLock = null;
 		lockChannel = null;
-		lockFile = null;
 	}
 
 	private long getRateLimitDelayMs(Response response)

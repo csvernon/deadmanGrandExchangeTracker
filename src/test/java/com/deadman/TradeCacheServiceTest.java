@@ -3,14 +3,16 @@ package com.deadman;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
-import java.io.File;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
+import java.io.InputStream;
 import java.lang.reflect.Method;
+import java.lang.reflect.Field;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import okhttp3.*;
+import net.runelite.client.util.Filepath;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -35,12 +37,20 @@ public class TradeCacheServiceTest
 		return gson.toJson(messages);
 	}
 
-	private File cache() throws Exception
+	private Filepath cache() throws Exception
 	{
-		File file = new File(folder.getRoot(), "cache.json");
-		Files.write(file.toPath(), ("{\"newestMessageId\":\"1000000000000000000\","
-			+ "\"oldestMessageId\":\"1000000000000000000\",\"backfillComplete\":true,\"trades\":[]}").getBytes(StandardCharsets.UTF_8));
+		Filepath file = Filepath.Unchecked.getRooted(folder.getRoot().toPath()).join("cache.json");
+		file.write("{\"newestMessageId\":\"1000000000000000000\","
+			+ "\"oldestMessageId\":\"1000000000000000000\",\"backfillComplete\":true,\"trades\":[]}");
 		return file;
+	}
+
+	private byte[] read(Filepath file) throws Exception
+	{
+		try (InputStream input = file.openInputStream())
+		{
+			return input.readAllBytes();
+		}
 	}
 
 	private OkHttpClient client(AtomicInteger requests)
@@ -72,8 +82,8 @@ public class TradeCacheServiceTest
 
 	@Test public void cacheWithoutCursorStillBackfillsHistory() throws Exception
 	{
-		File file = cache();
-		Files.write(file.toPath(), "{\"trades\":[{\"itemId\":999,\"state\":\"SOLD\"}]}".getBytes(StandardCharsets.UTF_8));
+		Filepath file = cache();
+		file.write("{\"trades\":[{\"itemId\":999,\"state\":\"SOLD\"}]}");
 		TradeCacheService service = new TradeCacheService(client(new AtomicInteger()), gson, file, 1000);
 		try
 		{
@@ -86,7 +96,7 @@ public class TradeCacheServiceTest
 
 	@Test public void followerDoesNotOverwriteCacheAndTakesOver() throws Exception
 	{
-		File file = cache();
+		Filepath file = cache();
 		AtomicInteger requests = new AtomicInteger();
 		OkHttpClient http = client(requests);
 		TradeCacheService owner = new TradeCacheService(http, gson, file, 30);
@@ -96,7 +106,7 @@ public class TradeCacheServiceTest
 			CountDownLatch loaded = new CountDownLatch(1);
 			owner.fetchFromDiscord(success -> { if (owner.getTradeCount() == 150) loaded.countDown(); });
 			assertTrue(loaded.await(5, TimeUnit.SECONDS));
-			byte[] before = Files.readAllBytes(file.toPath());
+			byte[] before = read(file);
 			CountDownLatch following = new CountDownLatch(1);
 			follower.fetchFromDiscord(success -> following.countDown());
 			assertTrue(following.await(5, TimeUnit.SECONDS));
@@ -104,7 +114,7 @@ public class TradeCacheServiceTest
 			CountDownLatch queued = new CountDownLatch(1);
 			follower.fetchNewTrades(success -> queued.countDown());
 			assertTrue(queued.await(5, TimeUnit.SECONDS));
-			assertArrayEquals(before, Files.readAllBytes(file.toPath()));
+			assertArrayEquals(before, read(file));
 			int initial = requests.get();
 			owner.shutdown();
 			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
@@ -112,6 +122,37 @@ public class TradeCacheServiceTest
 			assertTrue(requests.get() > initial);
 		}
 		finally { owner.shutdown(); follower.shutdown(); }
+	}
+
+	@Test public void shutdownDoesNotInterruptRunningWorkOrRunDelayedTasks() throws Exception
+	{
+		TradeCacheService service = new TradeCacheService(client(new AtomicInteger()), gson, cache(), 1000);
+		Field field = TradeCacheService.class.getDeclaredField("scheduler");
+		field.setAccessible(true);
+		ScheduledThreadPoolExecutor executor = (ScheduledThreadPoolExecutor) field.get(service);
+		CountDownLatch running = new CountDownLatch(1);
+		CountDownLatch release = new CountDownLatch(1);
+		AtomicBoolean interrupted = new AtomicBoolean();
+		AtomicBoolean delayedRan = new AtomicBoolean();
+		try
+		{
+			executor.execute(() ->
+			{
+				running.countDown();
+				try { release.await(5, TimeUnit.SECONDS); }
+				catch (InterruptedException e) { interrupted.set(true); }
+			});
+			assertTrue(running.await(5, TimeUnit.SECONDS));
+			executor.schedule(() -> delayedRan.set(true), 1, TimeUnit.HOURS);
+			service.shutdown();
+			service.shutdown();
+			assertFalse(executor.isTerminated());
+			release.countDown();
+			assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+			assertFalse(interrupted.get());
+			assertFalse(delayedRan.get());
+		}
+		finally { release.countDown(); service.shutdown(); }
 	}
 
 	@Test public void rateLimitHonorsLongServerDelay() throws Exception
