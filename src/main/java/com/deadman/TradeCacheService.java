@@ -14,15 +14,19 @@ import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.util.Filepath;
 import okhttp3.Call;
@@ -45,6 +49,13 @@ public class TradeCacheService
 	private static final long MIN_RATE_LIMIT_DELAY_MS = 5500;
 	private static final long MAX_RATE_LIMIT_DELAY_MS = 60000;
 	private final long cacheReloadIntervalMs;
+	private static final long PAGE_INTERVAL_MS = 5000;
+	private static final long UPDATE_INTERVAL_MS = 30000;
+	private long requestNotBeforeNanos;
+	private boolean initialized;
+	private boolean cacheDirty;
+	private ScheduledFuture<?> pendingUpdate;
+	private Consumer<Boolean> pendingNotification;
 
 	private static String xorDecode(String hex)
 	{
@@ -56,7 +67,11 @@ public class TradeCacheService
 		return sb.toString();
 	}
 
-	private final CopyOnWriteArrayList<GeTrade> trades = new CopyOnWriteArrayList<>();
+	// Mutated only on the worker; readers see immutable per-item snapshots.
+	private final Map<String, GeTrade> trades = new LinkedHashMap<>();
+	private final Map<Integer, List<GeTrade>> itemTrades = new HashMap<>();
+	private final Map<Integer, List<GeTrade>> itemSnapshots = new ConcurrentHashMap<>();
+	private volatile int tradeCount;
 	private String oldestMessageId = null;
 	private String newestMessageId = null;
 	private volatile boolean initialFetchDone = false;
@@ -96,11 +111,8 @@ public class TradeCacheService
 	{
 		dispatch(() ->
 		{
-			trades.add(0, trade);
-			if (syncOwner)
-			{
-				saveCache();
-			}
+			mergeTrades(Collections.singletonList(trade));
+			queueUpdate(null);
 		});
 	}
 
@@ -123,8 +135,20 @@ public class TradeCacheService
 
 	private void initialize(Consumer<Boolean> onComplete)
 	{
+		if (initialized)
+		{
+			if (!syncOwner || backfillInProgress) onComplete.accept(initialFetchDone);
+			else if (!backfillComplete) fetchPage(onComplete);
+			else startNewTrades(onComplete);
+			return;
+		}
+		initialized = true;
+		scheduler.scheduleWithFixedDelay(() ->
+		{
+			if (!stopped && pruneExpiredTrades()) queueUpdate(onComplete);
+		}, UPDATE_INTERVAL_MS, UPDATE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 		syncOwner = syncOwner || acquireSyncLock();
-		if (loadCache())
+		if (loadCache(onComplete))
 		{
 			log.info("Loaded {} Deadman trades from local cache", trades.size());
 			initialFetchDone = true;
@@ -159,7 +183,7 @@ public class TradeCacheService
 		}
 	}
 
-	private boolean loadCache()
+	private boolean loadCache(Consumer<Boolean> onComplete)
 	{
 		if (!CACHE_FILE.isFile())
 		{
@@ -175,11 +199,15 @@ public class TradeCacheService
 			}
 
 			trades.clear();
-			trades.addAll(cache.trades);
+			itemTrades.clear();
+			itemSnapshots.clear();
+			mergeTrades(cache.trades);
+			cacheDirty = cache.trades.size() != trades.size();
 			newestMessageId = cache.newestMessageId;
 			oldestMessageId = cache.oldestMessageId;
 			backfillComplete = cache.backfillComplete;
 			rememberCacheMetadata();
+			if (cacheDirty && syncOwner) queueUpdate(onComplete);
 			return newestMessageId != null || !trades.isEmpty();
 		}
 		catch (Exception e)
@@ -191,7 +219,7 @@ public class TradeCacheService
 
 	private void saveCache()
 	{
-		if (!syncOwner || stopped)
+		if (!syncOwner || !cacheDirty)
 		{
 			return;
 		}
@@ -204,7 +232,7 @@ public class TradeCacheService
 			cache.newestMessageId = newestMessageId;
 			cache.oldestMessageId = oldestMessageId;
 			cache.backfillComplete = backfillComplete;
-			cache.trades = new ArrayList<>(trades);
+			cache.trades = new ArrayList<>(trades.values());
 
 			Filepath temp = parent.createTempFile("trades-cache-", ".json");
 			try
@@ -227,11 +255,41 @@ public class TradeCacheService
 				temp.deleteIfExists();
 			}
 			rememberCacheMetadata();
+			cacheDirty = false;
 		}
 		catch (Exception e)
 		{
 			log.warn("Failed to save Deadman trade cache", e);
 		}
+	}
+
+	private void queueUpdate(Consumer<Boolean> onComplete)
+	{
+		cacheDirty = true;
+		if (onComplete != null) pendingNotification = onComplete;
+		if (pendingUpdate == null && !stopped)
+		{
+			pendingUpdate = scheduler.schedule(() -> flushUpdate(true), UPDATE_INTERVAL_MS, TimeUnit.MILLISECONDS);
+		}
+	}
+
+	private void flushUpdate(boolean notify)
+	{
+		if (pendingUpdate != null) pendingUpdate.cancel(false);
+		pendingUpdate = null;
+		pruneExpiredTrades();
+		saveCache();
+		Consumer<Boolean> callback = pendingNotification;
+		pendingNotification = null;
+		if (notify && !stopped && callback != null) callback.accept(true);
+	}
+
+	private void finishFetch(Consumer<Boolean> onComplete, boolean success)
+	{
+		initialFetchDone = true;
+		backfillInProgress = false;
+		flushUpdate(false);
+		if (!stopped) onComplete.accept(success);
 	}
 
 	private boolean acquireSyncLock()
@@ -265,7 +323,7 @@ public class TradeCacheService
 				if (!syncOwner && acquireSyncLock())
 				{
 					syncOwner = true;
-					loadCache();
+					loadCache(onComplete);
 					initialFetchDone = true;
 					if (newestMessageId == null || !backfillComplete)
 						fetchPage(onComplete);
@@ -286,7 +344,7 @@ public class TradeCacheService
 					return;
 				}
 
-				if (loadCache())
+				if (loadCache(onComplete))
 				{
 					initialFetchDone = true;
 					log.info("Reloaded {} Deadman trades from local cache", trades.size());
@@ -309,29 +367,65 @@ public class TradeCacheService
 		}
 	}
 
-	private void mergeTrades(List<GeTrade> parsed, boolean newestFirst)
+	private static long historyCutoff()
 	{
-		Map<String, GeTrade> merged = new LinkedHashMap<>();
-		if (newestFirst)
+		return java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).minusMonths(3).toInstant().toEpochMilli();
+	}
+
+	private void mergeTrades(List<GeTrade> parsed)
+	{
+		long cutoff = historyCutoff();
+		Set<Integer> changed = new HashSet<>();
+		for (GeTrade trade : parsed)
 		{
-			for (GeTrade trade : parsed)
+			if (trade != null && trade.getTimestamp() >= cutoff && trades.putIfAbsent(tradeKey(trade), trade) == null)
 			{
-				merged.put(tradeKey(trade), trade);
+				itemTrades.computeIfAbsent(trade.getItemId(), id -> new ArrayList<>()).add(trade);
+				changed.add(trade.getItemId());
 			}
 		}
-		for (GeTrade trade : trades)
+		publishItems(changed);
+	}
+
+	private boolean pruneExpiredTrades()
+	{
+		long cutoff = historyCutoff();
+		Set<Integer> changed = new HashSet<>();
+		Iterator<GeTrade> iterator = trades.values().iterator();
+		while (iterator.hasNext())
 		{
-			merged.putIfAbsent(tradeKey(trade), trade);
-		}
-		if (!newestFirst)
-		{
-			for (GeTrade trade : parsed)
+			GeTrade trade = iterator.next();
+			if (trade.getTimestamp() < cutoff)
 			{
-				merged.putIfAbsent(tradeKey(trade), trade);
+				changed.add(trade.getItemId());
+				iterator.remove();
 			}
 		}
-		trades.clear();
-		trades.addAll(merged.values());
+		for (int item : changed) itemTrades.get(item).removeIf(trade -> trade.getTimestamp() < cutoff);
+		publishItems(changed);
+		if (!changed.isEmpty()) cacheDirty = true;
+		return !changed.isEmpty();
+	}
+
+	private void publishItems(Set<Integer> changed)
+	{
+		for (int item : changed)
+		{
+			List<GeTrade> snapshot = new ArrayList<>(itemTrades.get(item));
+			snapshot.sort(Comparator.comparingLong(GeTrade::getTimestamp).reversed());
+			if (snapshot.isEmpty())
+			{
+				itemTrades.remove(item);
+				itemSnapshots.remove(item);
+			}
+			else itemSnapshots.put(item, Collections.unmodifiableList(snapshot));
+		}
+		tradeCount = trades.size();
+	}
+
+	private static long messageTimestamp(JsonObject message)
+	{
+		return (Long.parseLong(message.get("id").getAsString()) >> 22) + 1420070400000L;
 	}
 
 	private static String tradeKey(GeTrade trade)
@@ -361,9 +455,7 @@ public class TradeCacheService
 			public void onFailure(Call call, IOException e)
 			{
 				log.warn("Failed to fetch trades from Discord", e);
-				initialFetchDone = true;
-				backfillInProgress = false;
-				onComplete.accept(false);
+				finishFetch(onComplete, false);
 			}
 
 			@Override
@@ -383,17 +475,13 @@ public class TradeCacheService
 					if (!response.isSuccessful())
 					{
 						log.warn("Discord API returned status {}", response.code());
-						initialFetchDone = true;
-						backfillInProgress = false;
-						onComplete.accept(false);
+						finishFetch(onComplete, false);
 						return;
 					}
 
 					if (response.body() == null)
 					{
-						initialFetchDone = true;
-						backfillInProgress = false;
-						onComplete.accept(false);
+						finishFetch(onComplete, false);
 						return;
 					}
 
@@ -403,10 +491,8 @@ public class TradeCacheService
 					if (messages == null || messages.size() == 0)
 					{
 						backfillComplete = true;
-						saveCache();
-						initialFetchDone = true;
-						backfillInProgress = false;
-						onComplete.accept(true);
+						cacheDirty = true;
+						finishFetch(onComplete, true);
 						return;
 					}
 
@@ -419,7 +505,7 @@ public class TradeCacheService
 							parsed.add(trade);
 						}
 					}
-					mergeTrades(parsed, false);
+					mergeTrades(parsed);
 
 					// Track newest message ID (first in array = newest)
 					if (newestMessageId == null)
@@ -430,29 +516,23 @@ public class TradeCacheService
 					// Track oldest message ID for pagination
 					JsonObject lastMessage = messages.get(messages.size() - 1).getAsJsonObject();
 					oldestMessageId = lastMessage.get("id").getAsString();
-					saveCache();
-					log.info("Fetched {} Discord messages, cached {} Deadman trades so far", messages.size(), trades.size());
-					onComplete.accept(true);
+					queueUpdate(onComplete);
+					log.debug("Fetched {} Discord messages, cached {} Deadman trades so far", messages.size(), trades.size());
 
-					if (messages.size() == 100)
+					if (messages.size() == 100 && messageTimestamp(lastMessage) >= historyCutoff())
 					{
 						fetchPage(onComplete);
 					}
 					else
 					{
 						backfillComplete = true;
-						saveCache();
-						initialFetchDone = true;
-						backfillInProgress = false;
-						onComplete.accept(true);
+						finishFetch(onComplete, true);
 					}
 				}
 				catch (Exception e)
 				{
 					log.warn("Error processing Discord messages", e);
-					initialFetchDone = true;
-					backfillInProgress = false;
-					onComplete.accept(false);
+					finishFetch(onComplete, false);
 				}
 			}
 		});
@@ -525,17 +605,18 @@ public class TradeCacheService
 
 	public List<GeTrade> getTradesForItem(int itemId)
 	{
-		return trades.stream()
-			.filter(t -> t.getItemId() == itemId)
-			.sorted(Comparator.comparingLong(GeTrade::getTimestamp).reversed())
-			.collect(Collectors.toList());
+		return itemSnapshots.getOrDefault(itemId, Collections.emptyList());
 	}
 
 	public Set<Integer> getAllItemIds()
 	{
-		return trades.stream()
-			.map(GeTrade::getItemId)
-			.collect(Collectors.toSet());
+		return new HashSet<>(itemSnapshots.keySet());
+	}
+
+	public long getLatestTimestamp(int itemId)
+	{
+		List<GeTrade> snapshot = getTradesForItem(itemId);
+		return snapshot.isEmpty() ? 0 : snapshot.get(0).getTimestamp();
 	}
 
 	public void fetchNewTrades(Consumer<Boolean> onComplete)
@@ -564,6 +645,11 @@ public class TradeCacheService
 			return;
 		}
 		lastNewTradeFetchAttempt = now;
+		if (!backfillComplete)
+		{
+			fetchPage(onComplete);
+			return;
+		}
 
 		if (newestMessageId == null)
 		{
@@ -595,8 +681,7 @@ public class TradeCacheService
 			public void onFailure(Call call, IOException e)
 			{
 				log.warn("Failed to fetch new trades from Discord", e);
-				backfillInProgress = false;
-				onComplete.accept(false);
+				finishFetch(onComplete, false);
 			}
 
 			@Override
@@ -612,8 +697,7 @@ public class TradeCacheService
 					}
 					if (!response.isSuccessful() || response.body() == null)
 					{
-						backfillInProgress = false;
-						onComplete.accept(false);
+						finishFetch(onComplete, false);
 						return;
 					}
 					consecutiveRateLimits = 0;
@@ -624,9 +708,8 @@ public class TradeCacheService
 					if (messages == null || messages.size() == 0)
 					{
 						if (latestId != null) newestMessageId = latestId;
-						backfillInProgress = false;
-						saveCache();
-						onComplete.accept(true);
+						cacheDirty = true;
+						finishFetch(onComplete, true);
 						return;
 					}
 
@@ -643,6 +726,11 @@ public class TradeCacheService
 							reachedPrevious = true;
 							break;
 						}
+						if (messageTimestamp(element.getAsJsonObject()) < historyCutoff())
+						{
+							reachedPrevious = true;
+							break;
+						}
 						GeTrade trade = parseDiscordMessage(element.getAsJsonObject());
 						if (trade != null)
 						{
@@ -650,7 +738,8 @@ public class TradeCacheService
 						}
 					}
 
-					mergeTrades(parsed, true);
+					mergeTrades(parsed);
+					queueUpdate(onComplete);
 					if (!reachedPrevious && messages.size() == 100)
 					{
 						String before = messages.get(messages.size() - 1).getAsJsonObject().get("id").getAsString();
@@ -658,16 +747,12 @@ public class TradeCacheService
 						return;
 					}
 					newestMessageId = latest;
-					backfillInProgress = false;
-					saveCache();
-
-					onComplete.accept(true);
+					finishFetch(onComplete, true);
 				}
 				catch (Exception e)
 				{
 					log.warn("Error processing new Discord messages", e);
-					backfillInProgress = false;
-					onComplete.accept(false);
+					finishFetch(onComplete, false);
 				}
 			}
 		});
@@ -675,7 +760,7 @@ public class TradeCacheService
 
 	public int getTradeCount()
 	{
-		return trades.size();
+		return tradeCount;
 	}
 
 	public boolean isInitialFetchDone()
@@ -689,11 +774,18 @@ public class TradeCacheService
 		stopped = true;
 		for (Call call : activeCalls) call.cancel();
 		// Release ownership only after any running cache operation finishes.
-		scheduler.execute(this::closeLock);
+		scheduler.execute(() -> { flushUpdate(false); closeLock(); });
 		scheduler.shutdown();
 	}
 
 	private void enqueue(Request request, Callback callback)
+	{
+		if (stopped) return;
+		long delay = Math.max(0, requestNotBeforeNanos - System.nanoTime());
+		scheduler.schedule(() -> executeRequest(request, callback), delay, TimeUnit.NANOSECONDS);
+	}
+
+	private synchronized void executeRequest(Request request, Callback callback)
 	{
 		if (stopped) return;
 		Call call = httpClient.newCall(request);
@@ -704,7 +796,11 @@ public class TradeCacheService
 			public void onFailure(Call failed, IOException error)
 			{
 				activeCalls.remove(failed);
-				dispatch(() -> callback.onFailure(failed, error));
+				dispatch(() ->
+				{
+					requestNotBeforeNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PAGE_INTERVAL_MS);
+					callback.onFailure(failed, error);
+				});
 			}
 
 			@Override
@@ -716,6 +812,7 @@ public class TradeCacheService
 					scheduler.execute(() ->
 					{
 						if (stopped) { response.close(); return; }
+						requestNotBeforeNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PAGE_INTERVAL_MS);
 						try { callback.onResponse(completed, response); }
 						catch (IOException e) { response.close(); log.warn("Discord response failed", e); }
 					});

@@ -11,10 +11,12 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
 import java.util.Comparator;
-import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
@@ -31,6 +33,7 @@ import javax.swing.Timer;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import net.runelite.client.game.ItemManager;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.FontManager;
 
@@ -44,7 +47,12 @@ public class GePriceLookupPanel extends JPanel
 
 	private final TradeCacheService tradeCacheService;
 	private final ItemManager itemManager;
-	private final Map<Integer, String> itemNameCache = new HashMap<>();
+	private final Map<Integer, String> itemNameCache = new ConcurrentHashMap<>();
+	private static final int ITEM_NAMES_PER_TICK = 20;
+	private final AtomicBoolean nameResolutionQueued = new AtomicBoolean();
+	private boolean nameRefreshRequested;
+	private Iterator<Integer> pendingNames;
+	private volatile boolean stopped;
 	private Runnable onRefreshCallback;
 
 	private final JTextField searchField;
@@ -184,7 +192,7 @@ public class GePriceLookupPanel extends JPanel
 
 	private void fetchNewTrades()
 	{
-		if (fetchInProgress)
+		if (stopped || fetchInProgress)
 		{
 			return;
 		}
@@ -192,11 +200,13 @@ public class GePriceLookupPanel extends JPanel
 
 		tradeCacheService.fetchNewTrades(success ->
 		{
+			if (stopped) return;
 			fetchInProgress = false;
 			if (success)
 			{
 				SwingUtilities.invokeLater(() ->
 				{
+					if (stopped) return;
 					statusLabel.setText(tradeCacheService.getTradeCount() + " trades loaded");
 					updateResults(searchField.getText().trim());
 				});
@@ -210,16 +220,21 @@ public class GePriceLookupPanel extends JPanel
 
 	public void stopAutoRefresh()
 	{
+		stopped = true;
 		autoRefreshTimer.stop();
+		debounceTimer.stop();
 	}
 
 	public void refreshData()
 	{
+		if (stopped) return;
 		statusLabel.setText("Loading trades...");
 		tradeCacheService.fetchFromDiscord(success ->
 		{
+			if (stopped) return;
 			SwingUtilities.invokeLater(() ->
 			{
+				if (stopped) return;
 				if (success)
 				{
 					statusLabel.setText(tradeCacheService.getTradeCount() + " trades loaded");
@@ -238,6 +253,7 @@ public class GePriceLookupPanel extends JPanel
 
 	public void updateStatusLabel()
 	{
+		if (stopped) return;
 		if (tradeCacheService.isInitialFetchDone())
 		{
 			statusLabel.setText(tradeCacheService.getTradeCount() + " trades loaded");
@@ -247,6 +263,7 @@ public class GePriceLookupPanel extends JPanel
 
 	private void updateResults(String query)
 	{
+		if (stopped) return;
 		resultsPanel.removeAll();
 
 		Set<Integer> allItemIds = tradeCacheService.getAllItemIds();
@@ -268,8 +285,7 @@ public class GePriceLookupPanel extends JPanel
 			.map(id ->
 			{
 				String name = getItemName(id);
-				List<GeTrade> trades = tradeCacheService.getTradesForItem(id);
-				long latestTimestamp = trades.isEmpty() ? 0 : trades.get(0).getTimestamp();
+				long latestTimestamp = tradeCacheService.getLatestTimestamp(id);
 				return new Object[]{id, name, latestTimestamp};
 			})
 			.filter(arr ->
@@ -594,14 +610,39 @@ public class GePriceLookupPanel extends JPanel
 		SwingUtilities.invokeLater(() -> scrollPane.getVerticalScrollBar().setValue(0));
 	}
 
-	/**
-	 * Must be called on the client thread. Resolves all item names for
-	 * currently cached trades and stores them, then refreshes the UI on the EDT.
-	 */
-	public void resolveItemNames()
+	/** Coalesces background refreshes into one bounded client-thread task. */
+	public synchronized void requestItemNames(ClientThread thread)
 	{
-		for (int itemId : tradeCacheService.getAllItemIds())
+		if (stopped) return;
+		nameRefreshRequested = true;
+		if (nameResolutionQueued.compareAndSet(false, true))
 		{
+			thread.invokeLater((java.util.function.BooleanSupplier) () ->
+			{
+				synchronized (GePriceLookupPanel.this)
+				{
+					if (pendingNames == null) nameRefreshRequested = false;
+					boolean complete = resolveItemNames();
+					if (!stopped && complete && nameRefreshRequested) return false;
+					if (complete) nameResolutionQueued.set(false);
+					return complete;
+				}
+			});
+		}
+	}
+
+	/** Runs one client-thread batch; false asks ClientThread to resume on a later pass. */
+	public boolean resolveItemNames()
+	{
+		if (stopped) return true;
+		if (pendingNames == null)
+		{
+			pendingNames = tradeCacheService.getAllItemIds().stream()
+				.filter(id -> !itemNameCache.containsKey(id)).collect(Collectors.toList()).iterator();
+		}
+		for (int count = 0; count < ITEM_NAMES_PER_TICK && pendingNames.hasNext(); count++)
+		{
+			int itemId = pendingNames.next();
 			if (!itemNameCache.containsKey(itemId))
 			{
 				try
@@ -616,7 +657,10 @@ public class GePriceLookupPanel extends JPanel
 				}
 			}
 		}
+		if (pendingNames.hasNext()) return false;
+		pendingNames = null;
 		SwingUtilities.invokeLater(() -> updateResults(searchField.getText().trim()));
+		return true;
 	}
 
 	private String getItemName(int itemId)

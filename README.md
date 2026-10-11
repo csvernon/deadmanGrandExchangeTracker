@@ -9,6 +9,8 @@ A RuneLite plugin for permanent Deadman world 345, maintained by Riskin.
 - Records world-345 Grand Exchange transactions in the existing shared trade feed.
 - Stores its local trade cache in RuneLite's managed plugin directory.
 
+Trade history is limited to the most recent three calendar months (UTC). Older cached trades are removed during background loading, and history downloads stop at that boundary. Page requests are spaced at least five seconds apart and respect longer server rate-limit delays. During synchronization, cache saves and sidebar refresh notifications are batched every thirty seconds, with a final save when synchronization completes or the plugin is disabled. Item lookups use an index, and item names are resolved in small client-thread batches.
+
 ## Breaches And Deadman's Chests
 
 The plugin tracks breach and Deadman's Chest announcements received as game messages or broadcasts on world 345. Player chat cannot create markers.

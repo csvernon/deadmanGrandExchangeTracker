@@ -125,8 +125,9 @@ public class DeadmanPlugin extends Plugin
 		tradeCacheService = new TradeCacheService(okHttpClient, gson, getPluginDirectory());
 		bossBreachPanel = new BossBreachPanel();
 		gePriceLookupPanel = new GePriceLookupPanel(tradeCacheService, itemManager);
+		GePriceLookupPanel lookupPanel = gePriceLookupPanel;
 		gePriceLookupPanel.setOnRefreshCallback(() ->
-			clientThread.invokeLater(() -> gePriceLookupPanel.resolveItemNames())
+			lookupPanel.requestItemNames(clientThread)
 		);
 		deadmanPanel = new DeadmanPanel(bossBreachPanel, gePriceLookupPanel);
 
@@ -179,10 +180,10 @@ public class DeadmanPlugin extends Plugin
 
 		tradeCacheService.fetchFromDiscord(success ->
 		{
-			SwingUtilities.invokeLater(() -> gePriceLookupPanel.updateStatusLabel());
+			SwingUtilities.invokeLater(lookupPanel::updateStatusLabel);
 			if (success)
 			{
-				clientThread.invokeLater(() -> gePriceLookupPanel.resolveItemNames());
+				lookupPanel.requestItemNames(clientThread);
 			}
 		});
 	}
