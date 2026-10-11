@@ -1,11 +1,16 @@
 package com.deadman;
 
+import com.deadman.world.EventMarkersOverlay;
+import com.deadman.world.EventMinimapOverlay;
+import com.deadman.world.EventSession;
+import com.deadman.world.LocationIndex;
 import com.google.gson.Gson;
 import com.google.inject.Provides;
 import java.awt.Color;
 import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
+import java.time.Instant;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -17,6 +22,8 @@ import net.runelite.api.Client;
 import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
 import net.runelite.api.events.GameTick;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GrandExchangeOfferChanged;
 import net.runelite.api.events.ScriptCallbackEvent;
 import net.runelite.api.gameval.VarPlayerID;
@@ -25,11 +32,14 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.EventBus.Subscriber;
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.ui.overlay.worldmap.WorldMapPointManager;
 import net.runelite.client.util.ImageUtil;
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -42,8 +52,9 @@ import okhttp3.Response;
 @Slf4j
 @PluginDescriptor(
 	name = "Deadman",
-	description = "Logs Grand Exchange transactions on world 345 to an external server. View data at https://dmmhs2.onrender.com/ge",
-	tags = {"grandexchange", "deadman", "logging", "price", "breach"}
+	internalName = "deadman-helper",
+	description = "Tracks Grand Exchange Prices, Breaches, and Deadman Chests",
+	tags = {"grandexchange", "deadman", "logging", "price", "breach", "chest"}
 )
 public class DeadmanPlugin extends Plugin
 {
@@ -77,13 +88,27 @@ public class DeadmanPlugin extends Plugin
 	@Inject
 	private EventBus eventBus;
 
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private WorldMapPointManager worldMapPointManager;
+
 	private DeadmanPanel deadmanPanel;
+	private BossBreachPanel bossBreachPanel;
 	private TradeCacheService tradeCacheService;
 	private GePriceLookupPanel gePriceLookupPanel;
 	private NavigationButton navButton;
 	private Subscriber geOfferSub;
 	private Subscriber scriptCallbackSub;
 	private Subscriber gameTickSub;
+	private Subscriber chatSub;
+	private Subscriber gameStateSub;
+	private Subscriber configSub;
+	private volatile EventSession worldEventSession;
+	private EventMinimapOverlay eventMinimapOverlay;
+	private EventMarkersOverlay eventMapOverlay;
+	private long lastEventRevision = -1;
 	private int lastGeItemId = -1;
 
 	@Provides
@@ -98,12 +123,28 @@ public class DeadmanPlugin extends Plugin
 		log.info("Deadman plugin started");
 
 		tradeCacheService = new TradeCacheService(okHttpClient, gson, getPluginDirectory());
-		BossBreachPanel bossBreachPanel = new BossBreachPanel();
+		bossBreachPanel = new BossBreachPanel();
 		gePriceLookupPanel = new GePriceLookupPanel(tradeCacheService, itemManager);
 		gePriceLookupPanel.setOnRefreshCallback(() ->
 			clientThread.invokeLater(() -> gePriceLookupPanel.resolveItemNames())
 		);
 		deadmanPanel = new DeadmanPanel(bossBreachPanel, gePriceLookupPanel);
+
+		EventSession session = new EventSession(config, LocationIndex.bundled(gson));
+		worldEventSession = session;
+		lastEventRevision = -1;
+		eventMinimapOverlay = new EventMinimapOverlay(client, session::minimap);
+		eventMapOverlay = new EventMarkersOverlay(client, worldMapPointManager);
+		overlayManager.add(eventMinimapOverlay);
+		overlayManager.add(eventMapOverlay);
+		clientThread.invoke(() ->
+		{
+			if (worldEventSession == session)
+			{
+				session.session(client.getGameState(), client.getWorld());
+				refreshEvents(session);
+			}
+		});
 
 		BufferedImage icon;
 		try
@@ -132,6 +173,9 @@ public class DeadmanPlugin extends Plugin
 		geOfferSub = eventBus.register(GrandExchangeOfferChanged.class, this::onGrandExchangeOfferChanged, 0);
 		scriptCallbackSub = eventBus.register(ScriptCallbackEvent.class, this::onScriptCallbackEvent, -1);
 		gameTickSub = eventBus.register(GameTick.class, this::onGameTick, 0);
+		chatSub = eventBus.register(ChatMessage.class, this::onChatMessage, 0);
+		gameStateSub = eventBus.register(GameStateChanged.class, this::onGameStateChanged, 0);
+		configSub = eventBus.register(ConfigChanged.class, this::onConfigChanged, 0);
 
 		tradeCacheService.fetchFromDiscord(success ->
 		{
@@ -147,6 +191,31 @@ public class DeadmanPlugin extends Plugin
 	protected void shutDown()
 	{
 		log.info("Deadman plugin stopped");
+
+		EventSession session = worldEventSession;
+		EventMarkersOverlay mapOverlay = eventMapOverlay;
+		worldEventSession = null;
+		if (session != null)
+		{
+			clientThread.invoke(() ->
+			{
+				session.stop();
+				if (mapOverlay != null)
+				{
+					mapOverlay.clear();
+				}
+			});
+		}
+		if (eventMinimapOverlay != null)
+		{
+			overlayManager.remove(eventMinimapOverlay);
+			eventMinimapOverlay = null;
+		}
+		if (eventMapOverlay != null)
+		{
+			overlayManager.remove(eventMapOverlay);
+			eventMapOverlay = null;
+		}
 
 		if (navButton != null)
 		{
@@ -174,6 +243,18 @@ public class DeadmanPlugin extends Plugin
 		if (gameTickSub != null)
 		{
 			eventBus.unregister(gameTickSub);
+		}
+		if (chatSub != null)
+		{
+			eventBus.unregister(chatSub);
+		}
+		if (gameStateSub != null)
+		{
+			eventBus.unregister(gameStateSub);
+		}
+		if (configSub != null)
+		{
+			eventBus.unregister(configSub);
 		}
 		lastGeItemId = -1;
 	}
@@ -255,8 +336,66 @@ public class DeadmanPlugin extends Plugin
 
 	private static final int GE_WIDGET_GROUP = 465;
 
+	private void onChatMessage(ChatMessage event)
+	{
+		EventSession session = worldEventSession;
+		if (session != null)
+		{
+			session.session(client.getGameState(), client.getWorld());
+			session.message(event.getType(), event.getMessage(), Instant.now());
+			refreshEvents(session);
+		}
+	}
+
+	private void onGameStateChanged(GameStateChanged event)
+	{
+		EventSession session = worldEventSession;
+		if (session != null)
+		{
+			session.session(event.getGameState(), client.getWorld());
+			refreshEvents(session);
+		}
+	}
+
+	private void onConfigChanged(ConfigChanged event)
+	{
+		if (!"deadman".equals(event.getGroup()))
+		{
+			return;
+		}
+		EventSession session = worldEventSession;
+		if (session != null)
+		{
+			clientThread.invoke(() ->
+			{
+				if (worldEventSession == session)
+				{
+					session.configure();
+					refreshEvents(session);
+				}
+			});
+		}
+	}
+
+	private void refreshEvents(EventSession session)
+	{
+		if (worldEventSession == session && lastEventRevision != session.revision())
+		{
+			lastEventRevision = session.revision();
+			eventMapOverlay.show(session.markers());
+			bossBreachPanel.setEvents(session.rows());
+		}
+	}
+
 	private void onGameTick(GameTick event)
 	{
+		EventSession session = worldEventSession;
+		if (session != null)
+		{
+			session.session(client.getGameState(), client.getWorld());
+			session.tick(Instant.now());
+			refreshEvents(session);
+		}
 		try
 		{
 			if (client.getWorld() != TARGET_WORLD)

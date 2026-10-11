@@ -13,6 +13,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.TemporalAdjusters;
 import java.util.ArrayList;
 import java.util.List;
+import com.deadman.world.EventRecord;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -38,6 +39,7 @@ public class BossBreachPanel extends JPanel
 	private final JLabel countdownDescription = new JLabel();
 	private final JLabel breachTimeLabel = new JLabel();
 	private final Timer timer;
+	private final WorldEventsPanel eventsPanel = new WorldEventsPanel();
 
 	public BossBreachPanel()
 	{
@@ -80,6 +82,7 @@ public class BossBreachPanel extends JPanel
 		contentPanel.add(breachTimeLabel);
 
 		add(contentPanel, BorderLayout.NORTH);
+		add(eventsPanel, BorderLayout.CENTER);
 
 		timer = new Timer(1000, e -> update());
 		update();
@@ -89,10 +92,17 @@ public class BossBreachPanel extends JPanel
 	public void stopTimer()
 	{
 		timer.stop();
+		eventsPanel.stop();
+	}
+
+	public void setEvents(List<EventRecord> events)
+	{
+		eventsPanel.setEvents(events);
 	}
 
 	private void update()
 	{
+		eventsPanel.updateTimers();
 		try
 		{
 			BreachState state = calculateBreachState(ZonedDateTime.now(ZoneOffset.UTC));
