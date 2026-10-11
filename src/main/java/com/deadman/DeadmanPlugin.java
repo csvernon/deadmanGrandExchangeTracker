@@ -123,6 +123,7 @@ public class DeadmanPlugin extends Plugin
 		log.info("Deadman plugin started");
 
 		tradeCacheService = new TradeCacheService(okHttpClient, gson, getPluginDirectory());
+		tradeCacheService.setHistoryLimit(config.tradeHistoryLimit(), success -> {});
 		bossBreachPanel = new BossBreachPanel();
 		gePriceLookupPanel = new GePriceLookupPanel(tradeCacheService, itemManager);
 		GePriceLookupPanel lookupPanel = gePriceLookupPanel;
@@ -362,6 +363,20 @@ public class DeadmanPlugin extends Plugin
 	{
 		if (!"deadman".equals(event.getGroup()))
 		{
+			return;
+		}
+		if ("tradeHistoryLimit".equals(event.getKey()))
+		{
+			TradeCacheService cache = tradeCacheService;
+			GePriceLookupPanel panel = gePriceLookupPanel;
+			if (cache != null && panel != null)
+			{
+				cache.setHistoryLimit(config.tradeHistoryLimit(), success ->
+				{
+					SwingUtilities.invokeLater(panel::refreshHistory);
+					if (success) panel.requestItemNames(clientThread);
+				});
+			}
 			return;
 		}
 		EventSession session = worldEventSession;

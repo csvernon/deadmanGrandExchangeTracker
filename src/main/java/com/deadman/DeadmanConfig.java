@@ -8,6 +8,13 @@ import net.runelite.client.config.ConfigSection;
 @ConfigGroup("deadman")
 public interface DeadmanConfig extends Config
 {
+	@ConfigItem(keyName = "tradeHistoryLimit", name = "Trade history limit",
+		description = "How much recent Grand Exchange trade history to load and keep", position = 1)
+	default TradeHistoryLimit tradeHistoryLimit()
+	{
+		return TradeHistoryLimit.THREE_MONTHS;
+	}
+
 	@ConfigSection(name = "World event locations", description = "Breach and Deadman's Chest locations on world 345", position = 1)
 	String worldEventsSection = "worldEvents";
 

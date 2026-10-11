@@ -65,6 +65,7 @@ public class GePriceLookupPanel extends JPanel
 	private final Timer debounceTimer;
 	private final Timer autoRefreshTimer;
 	private volatile boolean fetchInProgress = false;
+	private Integer detailItemId;
 
 	public void setOnRefreshCallback(Runnable callback)
 	{
@@ -261,6 +262,13 @@ public class GePriceLookupPanel extends JPanel
 		}
 	}
 
+	public void refreshHistory()
+	{
+		if (stopped) return;
+		updateStatusLabel();
+		if (detailItemId != null) lookupItem(detailItemId);
+	}
+
 	private void updateResults(String query)
 	{
 		if (stopped) return;
@@ -431,6 +439,7 @@ public class GePriceLookupPanel extends JPanel
 
 	private void showItemDetail(int itemId, String itemName)
 	{
+		detailItemId = itemId;
 		detailPanel.removeAll();
 
 		// Back button
@@ -606,6 +615,7 @@ public class GePriceLookupPanel extends JPanel
 
 	private void showResults()
 	{
+		detailItemId = null;
 		cardLayout.show(cardWrapper, RESULTS_VIEW);
 		SwingUtilities.invokeLater(() -> scrollPane.getVerticalScrollBar().setValue(0));
 	}

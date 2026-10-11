@@ -66,6 +66,275 @@ public class TradeCacheServiceTest
 		}).build();
 	}
 
+	private void selectLimit(TradeCacheService service, TradeHistoryLimit limit) throws Exception
+	{
+		CountDownLatch applied = new CountDownLatch(1);
+		service.setHistoryLimit(limit, success -> applied.countDown());
+		assertTrue(applied.await(2, TimeUnit.SECONDS));
+	}
+
+	private void awaitWorker(TradeCacheService service) throws Exception
+	{
+		Field field = TradeCacheService.class.getDeclaredField("scheduler");
+		field.setAccessible(true);
+		CountDownLatch applied = new CountDownLatch(1);
+		((ScheduledThreadPoolExecutor) field.get(service)).execute(applied::countDown);
+		assertTrue(applied.await(2, TimeUnit.SECONDS));
+	}
+
+	@Test public void shorterSelectionImmediatelyPrunesAndRejectsOldLocalTrades() throws Exception
+	{
+		TradeCacheService service = new TradeCacheService(client(new AtomicInteger()), gson, cache(), 1000);
+		try
+		{
+			GeTrade recent = GeTrade.builder().itemId(1).timestamp(System.currentTimeMillis()).build();
+			GeTrade older = GeTrade.builder().itemId(2).timestamp(System.currentTimeMillis() - TimeUnit.DAYS.toMillis(20)).build();
+			service.addLocalTrade(recent);
+			service.addLocalTrade(older);
+			awaitWorker(service);
+			assertEquals(2, service.getTradeCount());
+			selectLimit(service, TradeHistoryLimit.ONE_WEEK);
+			assertEquals(1, service.getTradeCount());
+			service.addLocalTrade(older);
+			awaitWorker(service);
+			assertEquals(1, service.getTradeCount());
+			assertTrue(service.getTradesForItem(2).isEmpty());
+		}
+		finally { service.shutdown(); }
+	}
+
+	@Test public void expandingSelectionRestartsFromHeadAndRecoversTrimmedGap() throws Exception
+	{
+		Filepath file = cache();
+		AtomicInteger requests = new AtomicInteger();
+		TradeCacheService service = new TradeCacheService(client(requests), gson, file, 1000);
+		try
+		{
+			selectLimit(service, TradeHistoryLimit.ONE_WEEK);
+			CountDownLatch first = new CountDownLatch(1);
+			service.fetchFromDiscord(success -> { if (service.getTradeCount() == 150) first.countDown(); });
+			assertTrue(first.await(12, TimeUnit.SECONDS));
+			selectLimit(service, TradeHistoryLimit.THREE_MONTHS);
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(12);
+			while (requests.get() < 4 && System.nanoTime() < deadline) Thread.sleep(10);
+			assertEquals("Expansion must replay from the head, not skip already-pruned pages", 4, requests.get());
+			awaitWorker(service);
+			assertEquals(150, service.getTradeCount());
+		}
+		finally { service.shutdown(); }
+	}
+
+	@Test public void restartingWithLongerLimitInvalidatesShorterCacheCoverage() throws Exception
+	{
+		Filepath file = cache();
+		JsonObject cached = gson.fromJson(new String(read(file), java.nio.charset.StandardCharsets.UTF_8), JsonObject.class);
+		cached.addProperty("historyLimit", "ONE_WEEK");
+		cached.addProperty("newestMessageId", String.valueOf(BASE_MESSAGE_ID + 200L * 4194304));
+		cached.addProperty("oldestMessageId", "1");
+		file.write(gson.toJson(cached));
+		AtomicBoolean headRequested = new AtomicBoolean();
+		OkHttpClient http = new OkHttpClient.Builder().addInterceptor(chain ->
+		{
+			headRequested.set(chain.request().url().queryParameter("before") == null);
+			return new Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+				.body(ResponseBody.create(MediaType.parse("application/json"), page(50, 1))).build();
+		}).build();
+		TradeCacheService service = new TradeCacheService(http, gson, file, 1000);
+		try
+		{
+			CountDownLatch done = new CountDownLatch(1);
+			service.fetchFromDiscord(success -> { if (service.getTradeCount() == 50) done.countDown(); });
+			assertTrue(done.await(2, TimeUnit.SECONDS));
+			assertTrue(headRequested.get());
+			JsonObject saved = gson.fromJson(new String(read(file), java.nio.charset.StandardCharsets.UTF_8), JsonObject.class);
+			assertEquals("THREE_MONTHS", saved.get("historyLimit").getAsString());
+		}
+		finally { service.shutdown(); }
+	}
+
+	@Test public void selectedLimitFiltersCacheOnStartupAndIsSaved() throws Exception
+	{
+		Filepath file = cache();
+		JsonObject cached = gson.fromJson(new String(read(file), java.nio.charset.StandardCharsets.UTF_8), JsonObject.class);
+		cached.add("trades", gson.toJsonTree(java.util.Arrays.asList(
+			GeTrade.builder().itemId(1).timestamp(System.currentTimeMillis()).build(),
+			GeTrade.builder().itemId(2).timestamp(System.currentTimeMillis() - TimeUnit.DAYS.toMillis(20)).build())));
+		file.write(gson.toJson(cached));
+		Filepath selectedFile = file.getParent().join("trades-cache-TWO_WEEKS.json");
+		OkHttpClient http = new OkHttpClient.Builder().addInterceptor(chain -> new Response.Builder()
+			.request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+			.body(ResponseBody.create(MediaType.parse("application/json"), "[]")).build()).build();
+		TradeCacheService service = new TradeCacheService(http, gson, file, 1000);
+		try
+		{
+			selectLimit(service, TradeHistoryLimit.TWO_WEEKS);
+			CountDownLatch done = new CountDownLatch(1);
+			service.fetchFromDiscord(success ->
+			{
+				try
+				{
+					if (!selectedFile.isFile()) return;
+					JsonObject saved = gson.fromJson(new String(read(selectedFile), java.nio.charset.StandardCharsets.UTF_8), JsonObject.class);
+					if (saved.has("historyLimit")) done.countDown();
+				}
+				catch (Exception e) { throw new AssertionError(e); }
+			});
+			assertTrue(done.await(2, TimeUnit.SECONDS));
+			assertEquals(1, service.getTradeCount());
+			JsonObject saved = gson.fromJson(new String(read(selectedFile), java.nio.charset.StandardCharsets.UTF_8), JsonObject.class);
+			assertEquals("TWO_WEEKS", saved.get("historyLimit").getAsString());
+			assertEquals(1, saved.getAsJsonArray("trades").size());
+		}
+		finally { service.shutdown(); }
+	}
+
+	@Test public void staleResponseCannotFinishOrWriteNewSelection() throws Exception
+	{
+		Filepath file = cache();
+		CountDownLatch entered = new CountDownLatch(1);
+		CountDownLatch release = new CountDownLatch(1);
+		AtomicInteger requests = new AtomicInteger();
+		OkHttpClient http = new OkHttpClient.Builder().addInterceptor(chain ->
+		{
+			int number = requests.incrementAndGet();
+			if (number == 1)
+			{
+				entered.countDown();
+				try { release.await(12, TimeUnit.SECONDS); }
+				catch (InterruptedException e) { throw new java.io.IOException(e); }
+			}
+			return new Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+				.body(ResponseBody.create(MediaType.parse("application/json"), number == 1 ? page(50, 1) : "[]")).build();
+		}).build();
+		TradeCacheService service = new TradeCacheService(http, gson, file, 1000);
+		try
+		{
+			AtomicBoolean cancelled = new AtomicBoolean();
+			service.fetchFromDiscord(success -> { if (!success) cancelled.set(true); });
+			assertTrue(entered.await(2, TimeUnit.SECONDS));
+			CountDownLatch done = new CountDownLatch(1);
+			AtomicInteger notifications = new AtomicInteger();
+			service.setHistoryLimit(TradeHistoryLimit.ONE_WEEK, success ->
+			{
+				if (notifications.incrementAndGet() == 2) done.countDown();
+			});
+			awaitWorker(service);
+			assertTrue("Superseded refreshes must complete so the Refresh button is not stuck", cancelled.get());
+			release.countDown();
+			assertTrue(done.await(12, TimeUnit.SECONDS));
+			assertEquals(0, service.getTradeCount());
+			assertEquals(2, requests.get());
+			JsonObject saved = gson.fromJson(new String(read(file.getParent().join("trades-cache-ONE_WEEK.json")), java.nio.charset.StandardCharsets.UTF_8), JsonObject.class);
+			assertEquals("ONE_WEEK", saved.get("historyLimit").getAsString());
+			assertTrue(saved.get("backfillComplete").getAsBoolean());
+		}
+		finally { release.countDown(); service.shutdown(); }
+	}
+
+	@Test public void clientsWithDifferentLimitsDoNotPruneEachOthersHistory() throws Exception
+	{
+		Filepath file = cache();
+		JsonObject cached = gson.fromJson(new String(read(file), java.nio.charset.StandardCharsets.UTF_8), JsonObject.class);
+		cached.add("trades", gson.toJsonTree(java.util.Arrays.asList(
+			GeTrade.builder().itemId(1).timestamp(System.currentTimeMillis()).build(),
+			GeTrade.builder().itemId(2).timestamp(System.currentTimeMillis() - TimeUnit.DAYS.toMillis(20)).build())));
+		file.write(gson.toJson(cached));
+		OkHttpClient http = new OkHttpClient.Builder().addInterceptor(chain -> new Response.Builder()
+			.request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+			.body(ResponseBody.create(MediaType.parse("application/json"), "[]")).build()).build();
+		TradeCacheService owner = new TradeCacheService(http, gson, file, 1000);
+		TradeCacheService follower = new TradeCacheService(http, gson, file, 1000);
+		try
+		{
+			CountDownLatch loaded = new CountDownLatch(1);
+			owner.fetchFromDiscord(success -> loaded.countDown());
+			assertTrue(loaded.await(2, TimeUnit.SECONDS));
+			CountDownLatch following = new CountDownLatch(1);
+			follower.fetchFromDiscord(success -> following.countDown());
+			assertTrue(following.await(2, TimeUnit.SECONDS));
+			selectLimit(follower, TradeHistoryLimit.ONE_WEEK);
+			assertEquals(1, follower.getTradeCount());
+			assertEquals(2, owner.getTradeCount());
+			selectLimit(follower, TradeHistoryLimit.THREE_MONTHS);
+			assertEquals("Expansion must restore available shared history immediately", 2, follower.getTradeCount());
+			JsonObject original = gson.fromJson(new String(read(file), java.nio.charset.StandardCharsets.UTF_8), JsonObject.class);
+			assertEquals(2, original.getAsJsonArray("trades").size());
+		}
+		finally { owner.shutdown(); follower.shutdown(); }
+	}
+
+	@Test public void switchingUnfinishedInitialFetchToPopulatedCacheMarksItReady() throws Exception
+	{
+		Filepath file = Filepath.Unchecked.getRooted(folder.getRoot().toPath()).join("cache.json");
+		JsonObject cached = new JsonObject();
+		cached.addProperty("newestMessageId", String.valueOf(BASE_MESSAGE_ID));
+		cached.addProperty("backfillComplete", true);
+		cached.addProperty("historyLimit", "ONE_WEEK");
+		cached.add("trades", gson.toJsonTree(java.util.Collections.singletonList(
+			GeTrade.builder().itemId(1).timestamp(System.currentTimeMillis()).build())));
+		file.getParent().join("trades-cache-ONE_WEEK.json").write(gson.toJson(cached));
+		CountDownLatch entered = new CountDownLatch(1);
+		CountDownLatch release = new CountDownLatch(1);
+		OkHttpClient http = new OkHttpClient.Builder().addInterceptor(chain ->
+		{
+			entered.countDown();
+			try { release.await(5, TimeUnit.SECONDS); }
+			catch (InterruptedException e) { throw new java.io.IOException(e); }
+			return new Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+				.body(ResponseBody.create(MediaType.parse("application/json"), "[]")).build();
+		}).build();
+		TradeCacheService service = new TradeCacheService(http, gson, file, 1000);
+		try
+		{
+			service.fetchFromDiscord(success -> {});
+			assertTrue(entered.await(2, TimeUnit.SECONDS));
+			assertFalse(service.isInitialFetchDone());
+			selectLimit(service, TradeHistoryLimit.ONE_WEEK);
+			assertEquals(1, service.getTradeCount());
+			assertTrue("A loaded cache must enable subsequent manual and automatic refreshes", service.isInitialFetchDone());
+		}
+		finally { release.countDown(); service.shutdown(); }
+	}
+
+	@Test public void staleRateLimitStillDefersNewSelectionRequests() throws Exception
+	{
+		CountDownLatch entered = new CountDownLatch(1);
+		CountDownLatch release = new CountDownLatch(1);
+		AtomicInteger requests = new AtomicInteger();
+		OkHttpClient http = new OkHttpClient.Builder().addInterceptor(chain ->
+		{
+			requests.incrementAndGet();
+			entered.countDown();
+			try { release.await(5, TimeUnit.SECONDS); }
+			catch (InterruptedException e) { throw new java.io.IOException(e); }
+			return new Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(429).message("Limited")
+				.body(ResponseBody.create(MediaType.parse("application/json"), "{\"retry_after\":120}")).build();
+		}).build();
+		TradeCacheService service = new TradeCacheService(http, gson, cache(), 1000);
+		try
+		{
+			service.fetchFromDiscord(success -> {});
+			assertTrue(entered.await(2, TimeUnit.SECONDS));
+			selectLimit(service, TradeHistoryLimit.ONE_WEEK);
+			release.countDown();
+			Field rateLimits = TradeCacheService.class.getDeclaredField("consecutiveRateLimits");
+			rateLimits.setAccessible(true);
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+			while (System.nanoTime() < deadline)
+			{
+				awaitWorker(service);
+				if (rateLimits.getInt(service) > 0) break;
+				Thread.sleep(10);
+			}
+			assertEquals(1, rateLimits.getInt(service));
+			Field nextRequest = TradeCacheService.class.getDeclaredField("requestNotBeforeNanos");
+			nextRequest.setAccessible(true);
+			assertTrue(nextRequest.getLong(service) - System.nanoTime() > TimeUnit.SECONDS.toNanos(119));
+			assertEquals(1, requests.get());
+		}
+		finally { release.countDown(); service.shutdown(); }
+	}
+
 	@Test public void refreshPagesAll150MessagesAndKeepsLongPrices() throws Exception
 	{
 		AtomicInteger requests = new AtomicInteger();

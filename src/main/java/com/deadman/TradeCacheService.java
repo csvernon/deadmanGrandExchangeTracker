@@ -44,8 +44,9 @@ public class TradeCacheService
 	static final String CHANNEL_ID = xorDecode(
 		"6b6e6d62686e6a62686c696b6b6a6f696f6f69");
 	private static final String DISCORD_API_BASE = "https://discord.com/api/v10";
-	private final Filepath CACHE_FILE;
-	private final Filepath LOCK_FILE;
+	private final Filepath defaultCacheFile;
+	private Filepath CACHE_FILE;
+	private Filepath LOCK_FILE;
 	private static final long MIN_RATE_LIMIT_DELAY_MS = 5500;
 	private static final long MAX_RATE_LIMIT_DELAY_MS = 60000;
 	private final long cacheReloadIntervalMs;
@@ -55,7 +56,11 @@ public class TradeCacheService
 	private boolean initialized;
 	private boolean cacheDirty;
 	private ScheduledFuture<?> pendingUpdate;
+	private ScheduledFuture<?> cacheWatcher;
 	private Consumer<Boolean> pendingNotification;
+	private TradeHistoryLimit historyLimit = TradeHistoryLimit.THREE_MONTHS;
+	private long syncGeneration;
+	private Consumer<Boolean> activeFetchNotification;
 
 	private static String xorDecode(String hex)
 	{
@@ -100,6 +105,7 @@ public class TradeCacheService
 	{
 		this.httpClient = httpClient;
 		this.gson = gson;
+		this.defaultCacheFile = cacheFile;
 		this.CACHE_FILE = cacheFile;
 		this.LOCK_FILE = cacheFile.getParent().join("trades-cache.lock");
 		this.cacheReloadIntervalMs = reloadIntervalMs;
@@ -133,6 +139,58 @@ public class TradeCacheService
 		dispatch(() -> initialize(onComplete));
 	}
 
+	public void setHistoryLimit(TradeHistoryLimit limit, Consumer<Boolean> onComplete)
+	{
+		dispatch(() ->
+		{
+			TradeHistoryLimit selected = limit == null ? TradeHistoryLimit.THREE_MONTHS : limit;
+			if (historyLimit == selected)
+			{
+				onComplete.accept(initialFetchDone);
+				return;
+			}
+			if (initialized)
+			{
+				flushUpdate(false);
+				closeLock();
+				if (cacheWatcher != null) cacheWatcher.cancel(false);
+				syncOwner = false;
+				syncGeneration++;
+				backfillInProgress = false;
+				Consumer<Boolean> superseded = activeFetchNotification;
+				activeFetchNotification = null;
+				if (superseded != null) superseded.accept(false);
+			}
+			historyLimit = selected;
+			// Clients sharing a window share one sync owner; different windows cannot prune each other's cache.
+			CACHE_FILE = selected == TradeHistoryLimit.THREE_MONTHS ? defaultCacheFile
+				: defaultCacheFile.getParent().join("trades-cache-" + selected.name() + ".json");
+			LOCK_FILE = defaultCacheFile.getParent().join("trades-cache-" + selected.name() + ".lock");
+			if (selected == TradeHistoryLimit.THREE_MONTHS) LOCK_FILE = defaultCacheFile.getParent().join("trades-cache.lock");
+			pruneExpiredTrades();
+			oldestMessageId = null;
+			newestMessageId = null;
+			backfillComplete = false;
+			cacheDirty = true;
+			if (initialized)
+			{
+				syncOwner = acquireSyncLock();
+				if (loadCache(onComplete)) initialFetchDone = true;
+				flushUpdate(false);
+			}
+			onComplete.accept(true);
+			if (initialized)
+			{
+				if (syncOwner)
+				{
+					if (!backfillComplete || newestMessageId == null) fetchPage(onComplete);
+					else { lastNewTradeFetchAttempt = 0; startNewTrades(onComplete); }
+				}
+				else startCacheWatcher(onComplete);
+			}
+		});
+	}
+
 	private void initialize(Consumer<Boolean> onComplete)
 	{
 		if (initialized)
@@ -160,7 +218,7 @@ public class TradeCacheService
 				return;
 			}
 
-			if (newestMessageId == null || (!backfillComplete && oldestMessageId != null))
+			if (newestMessageId == null || !backfillComplete)
 			{
 				fetchPage(onComplete);
 				return;
@@ -185,12 +243,14 @@ public class TradeCacheService
 
 	private boolean loadCache(Consumer<Boolean> onComplete)
 	{
-		if (!CACHE_FILE.isFile())
+		Filepath source = CACHE_FILE;
+		if (!source.isFile() && historyLimit != TradeHistoryLimit.THREE_MONTHS) source = defaultCacheFile;
+		if (!source.isFile())
 		{
 			return false;
 		}
 
-		try (Reader reader = CACHE_FILE.openBufferedReader())
+		try (Reader reader = source.openBufferedReader())
 		{
 			CacheFile cache = gson.fromJson(reader, CacheFile.class);
 			if (cache == null || cache.trades == null)
@@ -202,10 +262,17 @@ public class TradeCacheService
 			itemTrades.clear();
 			itemSnapshots.clear();
 			mergeTrades(cache.trades);
-			cacheDirty = cache.trades.size() != trades.size();
+			cacheDirty = source != CACHE_FILE || cache.trades.size() != trades.size();
 			newestMessageId = cache.newestMessageId;
 			oldestMessageId = cache.oldestMessageId;
 			backfillComplete = cache.backfillComplete;
+			TradeHistoryLimit cachedLimit = cache.historyLimit == null ? TradeHistoryLimit.THREE_MONTHS : cache.historyLimit;
+			if (cachedLimit.ordinal() < historyLimit.ordinal())
+			{
+				oldestMessageId = null;
+				backfillComplete = false;
+			}
+			cacheDirty |= cachedLimit != historyLimit;
 			rememberCacheMetadata();
 			if (cacheDirty && syncOwner) queueUpdate(onComplete);
 			return newestMessageId != null || !trades.isEmpty();
@@ -232,6 +299,7 @@ public class TradeCacheService
 			cache.newestMessageId = newestMessageId;
 			cache.oldestMessageId = oldestMessageId;
 			cache.backfillComplete = backfillComplete;
+			cache.historyLimit = historyLimit;
 			cache.trades = new ArrayList<>(trades.values());
 
 			Filepath temp = parent.createTempFile("trades-cache-", ".json");
@@ -286,6 +354,7 @@ public class TradeCacheService
 
 	private void finishFetch(Consumer<Boolean> onComplete, boolean success)
 	{
+		activeFetchNotification = null;
 		initialFetchDone = true;
 		backfillInProgress = false;
 		flushUpdate(false);
@@ -315,11 +384,12 @@ public class TradeCacheService
 
 	private void startCacheWatcher(Consumer<Boolean> onComplete)
 	{
-		scheduler.scheduleWithFixedDelay(() ->
+		long generation = syncGeneration;
+		cacheWatcher = scheduler.scheduleWithFixedDelay(() ->
 		{
 			try
 			{
-				if (stopped) return;
+				if (stopped || generation != syncGeneration) return;
 				if (!syncOwner && acquireSyncLock())
 				{
 					syncOwner = true;
@@ -367,9 +437,9 @@ public class TradeCacheService
 		}
 	}
 
-	private static long historyCutoff()
+	private long historyCutoff()
 	{
-		return java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).minusMonths(3).toInstant().toEpochMilli();
+		return historyLimit.cutoff(java.time.Instant.now());
 	}
 
 	private void mergeTrades(List<GeTrade> parsed)
@@ -436,6 +506,7 @@ public class TradeCacheService
 
 	private void fetchPage(Consumer<Boolean> onComplete)
 	{
+		activeFetchNotification = onComplete;
 		backfillInProgress = true;
 		String url = DISCORD_API_BASE + "/channels/" + CHANNEL_ID + "/messages?limit=100";
 		if (oldestMessageId != null)
@@ -467,7 +538,7 @@ public class TradeCacheService
 					{
 						long delayMs = getRateLimitDelayMs(response);
 						log.warn("Rate limited while fetching Deadman trades, retrying in {}ms", delayMs);
-						scheduler.schedule(() -> fetchPage(onComplete), delayMs, TimeUnit.MILLISECONDS);
+						retryRequest(() -> fetchPage(onComplete), delayMs);
 						return;
 					}
 					consecutiveRateLimits = 0;
@@ -663,6 +734,7 @@ public class TradeCacheService
 
 	private void fetchNewPage(Consumer<Boolean> onComplete, String previousId, String beforeId, String latestId)
 	{
+		activeFetchNotification = onComplete;
 		String url = DISCORD_API_BASE + "/channels/" + CHANNEL_ID + "/messages?limit=100";
 		if (beforeId != null)
 		{
@@ -692,7 +764,7 @@ public class TradeCacheService
 					if (response.code() == 429)
 					{
 						long delay = getRateLimitDelayMs(response);
-						scheduler.schedule(() -> fetchNewPage(onComplete, previousId, beforeId, latestId), delay, TimeUnit.MILLISECONDS);
+						retryRequest(() -> fetchNewPage(onComplete, previousId, beforeId, latestId), delay);
 						return;
 					}
 					if (!response.isSuccessful() || response.body() == null)
@@ -781,13 +853,30 @@ public class TradeCacheService
 	private void enqueue(Request request, Callback callback)
 	{
 		if (stopped) return;
+		long generation = syncGeneration;
 		long delay = Math.max(0, requestNotBeforeNanos - System.nanoTime());
-		scheduler.schedule(() -> executeRequest(request, callback), delay, TimeUnit.NANOSECONDS);
+		scheduler.schedule(() -> executeRequest(request, callback, generation), delay, TimeUnit.NANOSECONDS);
 	}
 
-	private synchronized void executeRequest(Request request, Callback callback)
+	private void retryRequest(Runnable retry, long delayMs)
 	{
-		if (stopped) return;
+		long generation = syncGeneration;
+		scheduler.schedule(() ->
+		{
+			if (!stopped && generation == syncGeneration) retry.run();
+		}, delayMs, TimeUnit.MILLISECONDS);
+	}
+
+	private synchronized void executeRequest(Request request, Callback callback, long generation)
+	{
+		if (stopped || generation != syncGeneration) return;
+		long delay = requestNotBeforeNanos - System.nanoTime();
+		if (!activeCalls.isEmpty()) delay = Math.max(delay, TimeUnit.MILLISECONDS.toNanos(PAGE_INTERVAL_MS));
+		if (delay > 0)
+		{
+			scheduler.schedule(() -> executeRequest(request, callback, generation), delay, TimeUnit.NANOSECONDS);
+			return;
+		}
 		Call call = httpClient.newCall(request);
 		activeCalls.add(call);
 		call.enqueue(new Callback()
@@ -795,29 +884,38 @@ public class TradeCacheService
 			@Override
 			public void onFailure(Call failed, IOException error)
 			{
-				activeCalls.remove(failed);
 				dispatch(() ->
 				{
-					requestNotBeforeNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PAGE_INTERVAL_MS);
-					callback.onFailure(failed, error);
+					requestNotBeforeNanos = Math.max(requestNotBeforeNanos, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PAGE_INTERVAL_MS));
+					activeCalls.remove(failed);
+					if (generation == syncGeneration) callback.onFailure(failed, error);
 				});
 			}
 
 			@Override
 			public void onResponse(Call completed, Response response)
 			{
-				activeCalls.remove(completed);
 				try
 				{
 					scheduler.execute(() ->
 					{
-						if (stopped) { response.close(); return; }
-						requestNotBeforeNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PAGE_INTERVAL_MS);
+						if (stopped) { activeCalls.remove(completed); response.close(); return; }
+						requestNotBeforeNanos = Math.max(requestNotBeforeNanos, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PAGE_INTERVAL_MS));
+						if (generation != syncGeneration)
+						{
+							try (response)
+							{
+								if (response.code() == 429) getRateLimitDelayMs(response);
+							}
+							finally { activeCalls.remove(completed); }
+							return;
+						}
 						try { callback.onResponse(completed, response); }
 						catch (IOException e) { response.close(); log.warn("Discord response failed", e); }
+						finally { activeCalls.remove(completed); }
 					});
 				}
-				catch (java.util.concurrent.RejectedExecutionException e) { response.close(); }
+				catch (java.util.concurrent.RejectedExecutionException e) { activeCalls.remove(completed); response.close(); }
 			}
 		});
 	}
@@ -864,7 +962,9 @@ public class TradeCacheService
 
 		consecutiveRateLimits++;
 		long localBackoffMs = MIN_RATE_LIMIT_DELAY_MS * (1L << Math.min(consecutiveRateLimits - 1, 3));
-		return Math.max(discordDelayMs, Math.min(MAX_RATE_LIMIT_DELAY_MS, localBackoffMs));
+		long delayMs = Math.max(discordDelayMs, Math.min(MAX_RATE_LIMIT_DELAY_MS, localBackoffMs));
+		requestNotBeforeNanos = Math.max(requestNotBeforeNanos, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMs));
+		return delayMs;
 	}
 
 	private static class CacheFile
@@ -872,6 +972,7 @@ public class TradeCacheService
 		private String newestMessageId;
 		private String oldestMessageId;
 		private boolean backfillComplete;
+		private TradeHistoryLimit historyLimit;
 		private List<GeTrade> trades;
 	}
 }

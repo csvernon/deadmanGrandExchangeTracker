@@ -8,8 +8,9 @@ A RuneLite plugin for permanent Deadman world 345, maintained by Riskin.
 - Adds recent Deadman buy/sell prices to the Grand Exchange item text.
 - Records world-345 Grand Exchange transactions in the existing shared trade feed.
 - Stores its local trade cache in RuneLite's managed plugin directory.
+- Keeps separate caches for each history limit so clients using different settings do not remove each other's history.
 
-Trade history is limited to the most recent three calendar months (UTC). Older cached trades are removed during background loading, and history downloads stop at that boundary. Page requests are spaced at least five seconds apart and respect longer server rate-limit delays. During synchronization, cache saves and sidebar refresh notifications are batched every thirty seconds, with a final save when synchronization completes or the plugin is disabled. Item lookups use an index, and item names are resolved in small client-thread batches.
+The saved `Trade history limit` dropdown offers 1 week, 2 weeks, 1 month, 2 months, or 3 months, defaulting to 3 months. Weeks and calendar months are calculated in UTC. Changing the setting immediately removes trades outside the selected window and restarts background history loading to recover any missing trades. Older cached trades are removed during background loading, and history downloads stop at the selected boundary. Page requests are spaced at least five seconds apart and respect longer server rate-limit delays. During synchronization, cache saves and sidebar refresh notifications are batched every thirty seconds, with a final save when synchronization completes or the plugin is disabled. Item lookups use an index, and item names are resolved in small client-thread batches.
 
 ## Breaches And Deadman's Chests
 
