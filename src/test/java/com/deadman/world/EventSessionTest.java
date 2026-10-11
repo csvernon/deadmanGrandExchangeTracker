@@ -268,4 +268,3 @@ public class EventSessionTest
         session.message(ChatMessageType.BROADCAST,"A Deadman's Chest has spawned at Clock Tower!",at);
     }
 }
-
